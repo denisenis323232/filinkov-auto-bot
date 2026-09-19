@@ -1,43 +1,22 @@
 from __future__ import annotations
 
-import os
-import signal
 import subprocess
 import sys
 import time
 
 
 def main() -> int:
-    processor = subprocess.Popen([sys.executable, "run_photo_processor_v3.py"], env=os.environ.copy())
-    bot = subprocess.Popen([sys.executable, "run_hotfix.py"], env=os.environ.copy())
-
-    def stop(_sig=None, _frame=None):
-        for p in (processor, bot):
-            if p.poll() is None:
-                p.terminate()
-        deadline = time.time() + 10
-        while time.time() < deadline and any(p.poll() is None for p in (processor, bot)):
-            time.sleep(0.2)
-        for p in (processor, bot):
-            if p.poll() is None:
-                p.kill()
-
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
-
+    # New architecture: ChatGPT prepares/edits photos. Railway bot only moderates,
+    # queues and publishes. No automatic image processor runs here.
+    bot = subprocess.Popen([sys.executable, "run_moderation.py"])
     try:
         while True:
-            if processor.poll() is not None:
-                code = processor.returncode or 1
-                stop()
-                return code
             if bot.poll() is not None:
-                code = bot.returncode or 1
-                stop()
-                return code
+                return bot.returncode or 1
             time.sleep(1)
     finally:
-        stop()
+        if bot.poll() is None:
+            bot.terminate()
 
 
 if __name__ == "__main__":
