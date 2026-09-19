@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import re
-from urllib.parse import quote
 
 import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
@@ -115,6 +114,14 @@ def _dbx_download(path: str, timeout: int = 60) -> bytes:
     if r.status_code >= 400:
         raise RuntimeError(f"Dropbox download: {r.status_code} {r.text[:500]}")
     return r.content
+
+
+def _verify_dropbox():
+    _dbx_ensure_folder(DROPBOX_ROOT)
+    _dbx_ensure_folder(f"{DROPBOX_ROOT}/inbox")
+    _dbx_ensure_folder(f"{DROPBOX_ROOT}/ready")
+    _dbx_upload(f"{DROPBOX_ROOT}/.bot_healthcheck.txt", b"FILINKOV AUTO Dropbox OK")
+    _dbx_list(DROPBOX_ROOT)
 
 
 def _photo_urls(car):
@@ -257,6 +264,14 @@ async def poll_ready(context):
 
 async def post_init(app):
     await _original_post_init(app)
+    if DROPBOX_TOKEN:
+        try:
+            await asyncio.to_thread(_verify_dropbox)
+            b.log.info("Dropbox auth/read/write verification OK")
+        except Exception as exc:
+            b.log.error("Dropbox verification failed: %s", exc)
+    else:
+        b.log.error("DROPBOX_ACCESS_TOKEN is missing")
     app.job_queue.run_repeating(poll_ready, interval=20, first=8, name="dropbox-ready-poller")
 
 
