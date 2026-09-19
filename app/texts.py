@@ -19,31 +19,51 @@ def cny(value) -> str:
     return f"¥{round(float(value)):,}".replace(",", " ")
 
 
-def _short_features(text: str | None, limit: int = 7) -> list[str]:
+def _short_features(text: str | None, limit: int = 8) -> list[str]:
+    """Pick only features that are actually useful in a sales post.
+
+    We deliberately skip low-value filler such as DRLs, tyre-pressure display,
+    automatic headlights and other standard equipment.
+    """
     if not text:
         return []
-    t = re.sub(r"\s+", " ", text)
-    dictionary = [
-        ("кож", "Кожаный салон"),
-        ("подогрев", "Подогрев сидений"),
-        ("камера", "Камера заднего вида"),
-        ("климат", "Климат-контроль"),
-        ("круиз", "Круиз-контроль"),
-        ("навига", "Навигация"),
-        ("carplay", "Apple CarPlay"),
-        ("carlife", "CarLife"),
-        ("панорам", "Панорамная крыша"),
-        ("электросид", "Электрорегулировка сидений"),
-        ("электрическ", "Электроприводы"),
-        ("голосов", "Голосовое управление"),
-        ("датчик давления", "Контроль давления в шинах"),
-        ("дневн", "Дневные ходовые огни"),
-        ("автоматическ", "Автоматические функции"),
+
+    low = re.sub(r"\s+", " ", text).lower()
+    out: list[str] = []
+
+    # Priority order: cameras/driver assists -> steering/comfort -> interior/material -> multimedia.
+    feature_groups = [
+        (("360", "кругов", "панорамн камер", "around view"), "Камеры 360°"),
+        (("камера зад", "rear camera", "заднего вида"), "Камера заднего вида"),
+        (("парктрон", "parking sensor", "датчик парков"), "Парктроники"),
+        (("слепых зон", "blind spot", "bsd", "bsm"), "Контроль слепых зон"),
+        (("удержан", "lane keep", "lka", "полос"), "Удержание в полосе"),
+        (("адаптивн", "adaptive cruise", "acc"), "Адаптивный круиз-контроль"),
+        (("круиз", "cruise control"), "Круиз-контроль"),
+        (("экстренн торм", "collision", "aeb", "предотвращен столк"), "Система предотвращения столкновений"),
+        (("мультируль", "многофункциональн рул", "multifunction steering"), "Мультируль"),
+        (("подогрев рул", "heated steering"), "Подогрев руля"),
+        (("электросид", "электрорегулировк сид", "power seat"), "Электрорегулировка сидений"),
+        (("память сид", "seat memory"), "Память сидений"),
+        (("вентиляц", "ventilated seat"), "Вентиляция сидений"),
+        (("подогрев сид", "heated seat"), "Подогрев сидений"),
+        (("алькантар", "alcantara"), "Салон Alcantara"),
+        (("кожан", "кожа", "leather"), "Кожаный салон"),
+        (("тканев", "fabric seat"), "Тканевый салон"),
+        (("панорамн крыш", "панорамн люк", "panoramic"), "Панорамная крыша"),
+        (("бесключ", "keyless", "keyless entry"), "Бесключевой доступ"),
+        (("электропривод багаж", "power tailgate", "electric tailgate"), "Электропривод багажника"),
+        (("проекц", "head-up", "hud"), "Проекция на лобовое стекло"),
+        (("цифровая прибор", "цифровая панель", "digital cluster"), "Цифровая приборная панель"),
+        (("carplay", "apple carplay"), "Apple CarPlay"),
+        (("android auto",), "Android Auto"),
+        (("carlife",), "CarLife"),
+        (("навига", "navigation"), "Навигация"),
+        (("голосов управ", "voice control"), "Голосовое управление"),
     ]
-    out = []
-    low = t.lower()
-    for needle, label in dictionary:
-        if needle in low and label not in out:
+
+    for needles, label in feature_groups:
+        if any(n in low for n in needles) and label not in out:
             out.append(label)
         if len(out) >= limit:
             break
@@ -93,7 +113,7 @@ def generate_post(car) -> str:
         lines += ["", f"По состоянию: {condition}."]
 
     if features:
-        lines += ["", "Что есть в машине:"]
+        lines += ["", "Из полезного оснащения:"]
         lines += [f"— {x}" for x in features]
 
     if final:
