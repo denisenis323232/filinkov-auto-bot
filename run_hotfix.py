@@ -30,9 +30,13 @@ def _infer_engine_cc(car) -> int | None:
         ("bmw 1 series", 1499),
         ("120i", 1499),
         ("audi q2", 1395),
-        ("35t", 1395),
+        ("audi q3", 1395),
+        ("audi а3", 1395),
+        ("audi a3", 1395),
         ("audi а3l", 1395),
         ("audi a3l", 1395),
+        ("35t", 1395),
+        ("35 tfsi", 1395),
         ("changan cs35plus", 1392),
         ("geely coolray", 1398),
         ("honda vezel", 1498),
@@ -44,6 +48,8 @@ def _infer_engine_cc(car) -> int | None:
         ("mazda cx-5", 1998),
         ("volkswagen passat", 1395),
         ("volkswagen golf", 1395),
+        ("toyota corolla", 1197),
+        ("1.2l pioneer", 1197),
         ("280tsi", 1395),
         ("280t", 1395),
     ]
@@ -72,8 +78,8 @@ async def ensure_source_and_price_hotfix(car, force_price: bool = True):
 
 
 async def quiet_poll_ready(context):
-    # Intentionally no automatic albums to the owner chat. This prevents floods.
-    # Ready photos stay in Dropbox and are used only when explicitly previewed/published.
+    # Legacy ready poller is intentionally silent. run_moderation.py owns the safe
+    # individual-photo moderation import and never publishes without approval.
     return
 
 
