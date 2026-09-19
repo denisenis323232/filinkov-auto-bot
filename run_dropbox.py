@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import time
 
 import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
@@ -15,6 +16,7 @@ from telegram.constants import ParseMode
 
 from app import bot as b
 from app.local_brand import brand_photo_bytes
+from app.pricing import calculate_customs, fetch_cbr_rates, final_price as calculate_final_price
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -22,6 +24,8 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 DROPBOX_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN", "").strip()
 DROPBOX_ROOT = os.getenv("DROPBOX_ROOT", "/FILINKOV_AUTO").rstrip("/")
 _original_post_init = b.post_init
+_original_buttons = b.buttons
+_RATES_CACHE: tuple[float, dict[str, float]] | None = None
 
 
 def _safe(value: str) -> str:
@@ -37,7 +41,7 @@ def job_id(car) -> str:
 
 def kb_car(car_id: int):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💰 Таможня", callback_data=f"customs:{car_id}")],
+        [InlineKeyboardButton("💰 Пересчитать цену", callback_data=f"price:{car_id}")],
         [InlineKeyboardButton("✏️ Изменить текст", callback_data=f"edit:{car_id}"), InlineKeyboardButton("🎙 Голос", callback_data=f"voice:{car_id}")],
         [InlineKeyboardButton("✅ Одобрить", callback_data=f"approve:{car_id}"), InlineKeyboardButton("🚀 Сейчас", callback_data=f"publish:{car_id}")],
         [InlineKeyboardButton("⏭ Пропустить", callback_data=f"skip:{car_id}"), InlineKeyboardButton("➡️ Следующая", callback_data=f"next:{car_id}")],
@@ -240,17 +244,86 @@ def _process_pending_jobs(limit: int = 5) -> None:
                 b.log.exception("Could not locally brand Dropbox job %s", jid)
 
 
-async def _ensure_source(car):
-    if car["source_url"] and (not car["source_description"] or not car["media_json"]):
+def _rates() -> dict[str, float]:
+    global _RATES_CACHE
+    now = time.monotonic()
+    if _RATES_CACHE and now - _RATES_CACHE[0] < 900:
+        return _RATES_CACHE[1]
+    value = fetch_cbr_rates(b.S.http_timeout)
+    _RATES_CACHE = (now, value)
+    return value
+
+
+def _calculate_price(car):
+    rates = _rates()
+    breakdown = calculate_customs(
+        price_cny=float(car["price_cny"] or 0),
+        cny_rub=rates["CNY"],
+        eur_rub=rates["EUR"],
+        engine_cc=car["engine_cc"],
+        power_hp=car["power_hp"],
+        year=car["year"],
+        month_text=car["month_text"],
+        engine_type=car["engine_type"],
+    )
+    total = calculate_final_price(
+        price_cny=float(car["price_cny"] or 0),
+        cny_rub=rates["CNY"],
+        customs_rub=breakdown.total_customs_rub,
+        extra_cny=b.S.extra_cny,
+        delivery_rub=b.S.delivery_rub,
+        other_rub=b.S.other_rub,
+    )
+    b.DB.set_customs(car["id"], breakdown.total_customs_rub, rates["CNY"], total)
+    refreshed = b.DB.get_car(car["id"])
+    b.DB.set_car_text(car["id"], b.generate_post(refreshed))
+    return b.DB.get_car(car["id"]), breakdown
+
+
+def _price_summary_html(car, breakdown) -> str:
+    age_label = {
+        "up_to_3": "до 3 лет",
+        "3_to_5": "3–5 лет",
+        "over_5": "старше 5 лет",
+    }.get(breakdown.age_class, breakdown.age_class)
+    return (
+        f"💰 <b>Расчёт готов</b>\n"
+        f"Объём: <b>{car['engine_cc']} см³</b> · возраст: <b>{age_label}</b>\n"
+        f"Пошлина: <b>{b.rub(breakdown.duty_rub)} ₽</b> ({html.escape(breakdown.duty_rate_label)})\n"
+        f"Таможенный сбор: <b>{b.rub(breakdown.clearance_fee_rub)} ₽</b>\n"
+        f"Утильсбор: <b>{b.rub(breakdown.recycling_fee_rub)} ₽</b>\n"
+        f"Всего таможня: <b>{b.rub(breakdown.total_customs_rub)} ₽</b>\n"
+        f"Курс ЦБ: CNY <b>{breakdown.cny_rub:.4f}</b> ₽ · EUR <b>{breakdown.eur_rub:.4f}</b> ₽\n\n"
+        f"💸 <b>ИТОГО В МОСКВЕ: {b.rub(car['final_price_rub'])} ₽</b>"
+    )
+
+
+async def _ensure_source_and_price(car, force_price: bool = True):
+    if car["source_url"] and (not car["source_description"] or not car["media_json"] or not car["engine_cc"]):
         source = await asyncio.to_thread(b.extract_card, car["source_url"], b.S.http_timeout)
         b.DB.set_source_card(car["id"], source.media_urls, source.description, source.engine_cc, source.engine_type)
         car = b.DB.get_car(car["id"])
+
+    breakdown = None
+    price_error = None
+    if force_price or not car["final_price_rub"]:
+        try:
+            car, breakdown = await asyncio.to_thread(_calculate_price, car)
+        except ValueError as exc:
+            price_error = str(exc)
+            b.log.info("Auto price skipped for car %s: %s", car["id"], exc)
+        except Exception as exc:
+            price_error = f"{type(exc).__name__}: {exc}"
+            b.log.exception("Auto price failed for car %s", car["id"])
+
+    if not car["post_text"]:
         b.DB.set_car_text(car["id"], b.generate_post(car))
-    return car
+        car = b.DB.get_car(car["id"])
+    return car, breakdown, price_error
 
 
 async def send_car(message, car):
-    car = await _ensure_source(car)
+    car, breakdown, price_error = await _ensure_source_and_price(car, force_price=True)
     branded = json.loads(car["branded_media_json"] or "[]") if "branded_media_json" in car.keys() else []
     jid = job_id(car)
     count = 0
@@ -265,18 +338,24 @@ async def send_car(message, car):
                 b.log.exception("Dropbox/local branding staging failed")
                 await message.reply_text(f"⚠️ Обработка фото: {type(exc).__name__}: {exc}")
 
-    price = f"<b>{b.rub(car['final_price_rub'])} ₽</b>" if car["final_price_rub"] else "<i>ещё не рассчитана</i>"
+    price = f"<b>{b.rub(car['final_price_rub'])} ₽</b>" if car["final_price_rub"] else "<i>авторасчёт не выполнен</i>"
+    customs = f"{b.rub(car['customs_rub'])} ₽" if car["customs_rub"] else "—"
+    engine = f"{car['engine_cc']} см³" if car["engine_cc"] else "не найден"
     text = (
         f"🚗 <b>{html.escape(car['model'] or '—')}</b>\n"
         f"№ {html.escape(car['inventory_no'] or '—')}\n\n"
         f"{html.escape(str(car['month_text'] or car['year'] or '—'))}\n"
         f"Пробег: {b.rub(car['mileage_km'])} км\n"
         f"Мощность: {car['power_hp'] or '—'} л.с.\n"
+        f"Двигатель: {html.escape(engine)}\n"
         f"Комплектация: {html.escape(car['trim'] or '—')}\n\n"
+        f"🛃 Таможня + сборы: <b>{customs}</b>\n"
         f"💸 ИТОГОВАЯ ЦЕНА В МОСКВЕ: {price}\n\n"
         f"☁️ ID фото: <code>{html.escape(jid)}</code>\n"
         f"Статус: <b>{html.escape(car['status'])}</b>"
     )
+    if price_error:
+        text += f"\n\n⚠️ Авторасчёт: {html.escape(price_error)}"
     await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_car(car["id"]), disable_web_page_preview=True)
 
     if branded:
@@ -289,11 +368,31 @@ async def send_car(message, car):
         )
 
 
+async def buttons(update, context):
+    q = update.callback_query
+    if q and (q.data or "").startswith("price:"):
+        if not await b.guard(update):
+            return
+        await q.answer()
+        try:
+            car_id = int((q.data or "").split(":", 1)[1])
+            car = b.DB.get_car(car_id)
+            car, breakdown, price_error = await _ensure_source_and_price(car, force_price=True)
+            if breakdown:
+                await q.message.reply_text(_price_summary_html(car, breakdown), parse_mode=ParseMode.HTML)
+            else:
+                await q.message.reply_text(f"⚠️ Не смог посчитать автоматически: {price_error or 'не хватает данных'}")
+        except Exception as exc:
+            b.log.exception("Manual auto-price refresh failed")
+            await q.message.reply_text(f"⚠️ Ошибка расчёта: {type(exc).__name__}: {exc}")
+        return
+    await _original_buttons(update, context)
+
+
 async def poll_ready(context):
     if not DROPBOX_TOKEN:
         return
 
-    # First finish any jobs that were uploaded before OpenCV branding was deployed.
     await asyncio.to_thread(_process_pending_jobs)
 
     owner = b.DB.get_setting("owner_user_id")
@@ -361,6 +460,7 @@ async def post_init(app):
 
 b.kb_car = kb_car
 b.send_car = send_car
+b.buttons = buttons
 b.post_init = post_init
 
 if __name__ == "__main__":
