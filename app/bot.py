@@ -2,6 +2,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
@@ -16,7 +17,7 @@ from .db import Database
 from .excel_parser import parse_excel
 from .pricing import fetch_cny_rub, final_price
 from .source_avtomir import extract_card
-from .texts import generate_post, generate_voice_script, rub
+from .texts import generate_post, render_channel_post, generate_voice_script, rub, cny
 
 log = logging.getLogger("filinkov-auto")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -61,31 +62,25 @@ async def guard(update: Update) -> bool:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update):
-        return
+    if not await guard(update): return
     await update.message.reply_text(
         "🚗 <b>FILINKOV AUTO — контент-менеджер</b>\n\n"
-        "Пришли Excel поставщика. Я отфильтрую машины, заберу описание и первые 10 фото из карточки и подготовлю пост.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb_home(),
-    )
+        "Пришли Excel поставщика. Я отфильтрую машины, соберу очередь и подготовлю карточки к публикации.",
+        parse_mode=ParseMode.HTML, reply_markup=kb_home())
 
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update):
-        return
+    if not await guard(update): return
     await update.message.reply_text(f"Твой Telegram ID: <code>{update.effective_user.id}</code>", parse_mode=ParseMode.HTML)
 
 
 async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update):
-        return
+    if not await guard(update): return
     doc = update.message.document
     name = doc.file_name or "supplier.xlsx"
     if not name.lower().endswith((".xls", ".xlsx")):
         await update.message.reply_text("Нужен Excel: .xls или .xlsx")
         return
-
     await update.message.reply_text("⏳ Excel получил. Разбираю и фильтрую...")
     folder = S.data_dir / "imports"
     folder.mkdir(parents=True, exist_ok=True)
@@ -99,9 +94,9 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for car in result.cars:
             DB.upsert_car(car)
         DB.update_import_counts(import_id, result.total, result.accepted, result.manual, result.rejected)
-    except Exception as exc:
+    except Exception as e:
         log.exception("Excel parse failed")
-        await update.message.reply_text(f"❌ Не смог разобрать Excel: {exc}")
+        await update.message.reply_text(f"❌ Не смог разобрать Excel: {e}")
         return
 
     await update.message.reply_text(
@@ -112,7 +107,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Отсеяно: <b>{result.rejected}</b>\n\n"
         "Открывай очередь 👇",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚗 Открыть очередь", callback_data="queue:0")]]),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚗 Открыть очередь", callback_data="queue:0")]])
     )
 
 
@@ -131,9 +126,9 @@ async def send_car(message, car):
     month_text = html.escape(str(car["month_text"] or car["year"] or "—"))
 
     price = (
-        f"\n💸 <b>ИТОГОВАЯ ЦЕНА — {rub(car['final_price_rub'])} ₽</b>\n"
+        f"\n💸 <b>ИТОГОВАЯ ЦЕНА В МОСКВЕ: {rub(car['final_price_rub'])} ₽</b>\n"
         if car["final_price_rub"] else
-        "\n💸 <b>ИТОГОВАЯ ЦЕНА — ещё не рассчитана</b>\n"
+        "\n💸 <b>ИТОГОВАЯ ЦЕНА В МОСКВЕ: ещё не рассчитана</b>\n"
     )
 
     text = (
@@ -146,7 +141,12 @@ async def send_car(message, car):
         f"{price}\n"
         f"Статус: <b>{html.escape(car['status'])}</b>"
     )
-    await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_car(car["id"]), disable_web_page_preview=True)
+    await message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_car(car["id"]),
+        disable_web_page_preview=True,
+    )
 
     media = json.loads(car["media_json"] or "[]")
     photos = [u for u in media if any(x in u.lower() for x in (".jpg", ".jpeg", ".png", ".webp"))][:10]
@@ -157,7 +157,7 @@ async def send_car(message, car):
             log.exception("Could not preview photos for car %s", car["id"])
 
     await message.reply_text(
-        "📝 <b>Черновик поста</b>\n\n" + html.escape(car["post_text"] or generate_post(car)),
+        "📝 <b>Черновик поста</b>\n\n" + render_channel_post(car, DB.get_setting("owner_user_id")),
         parse_mode=ParseMode.HTML,
     )
 
@@ -167,22 +167,21 @@ async def queue_from(message, offset: int = 0):
     if not cars:
         await message.reply_text("Очередь пустая. Загрузи Excel.", reply_markup=kb_home())
         return
-    idx = max(0, min(offset, len(cars) - 1))
+    idx = max(0, min(offset, len(cars)-1))
     await send_car(message, cars[idx])
 
 
 async def stats(message):
     counts = DB.count_by_status()
-    labels = {"READY": "Готовы", "MANUAL": "Ручная проверка", "REJECTED": "Отсеяны", "APPROVED": "Одобрены", "PUBLISHED": "Опубликованы", "SKIPPED": "Пропущены"}
     lines = ["📈 <b>Статус базы</b>", ""]
-    for key, value in counts.items():
-        lines.append(f"{labels.get(key, key)}: <b>{value}</b>")
+    labels = {"READY":"Готовы", "MANUAL":"Ручная проверка", "REJECTED":"Отсеяны", "APPROVED":"Одобрены", "PUBLISHED":"Опубликованы", "SKIPPED":"Пропущены"}
+    for k, v in counts.items():
+        lines.append(f"{labels.get(k,k)}: <b>{v}</b>")
     await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update):
-        return
+    if not await guard(update): return
     q = update.callback_query
     await q.answer()
     action, _, payload = q.data.partition(":")
@@ -197,23 +196,18 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         channel = DB.get_setting("channel_id", S.channel_id or "не задан")
         await q.message.reply_text(
             "⚙️ <b>Настройки</b>\n\n"
-            f"Канал: <code>{html.escape(channel)}</code>\n"
+            f"Канал: <code>{channel}</code>\n"
             f"Возраст: {S.min_age_years}–{S.max_age_years} лет\n"
             f"Макс. мощность: {S.max_power_hp} л.с.\n"
-            f"Публикации: {', '.join(map(str, S.publish_hours))}:00 ({S.timezone})",
-            parse_mode=ParseMode.HTML,
-        )
+            f"Публикации: {', '.join(map(str,S.publish_hours))}:00 ({S.timezone})\n\n"
+            "Канал можно задать командой:\n<code>/setchannel @filinkovauto</code>", parse_mode=ParseMode.HTML)
     elif action == "next":
         cars = DB.list_cars(("READY", "APPROVED"), limit=200)
         ids = [c["id"] for c in cars]
-        try:
-            idx = ids.index(int(payload)) + 1
-        except ValueError:
-            idx = 0
-        if idx >= len(cars):
-            idx = 0
-        if cars:
-            await send_car(q.message, cars[idx])
+        try: idx = ids.index(int(payload)) + 1
+        except ValueError: idx = 0
+        if idx >= len(cars): idx = 0
+        await send_car(q.message, cars[idx])
     elif action == "skip":
         DB.set_car_status(int(payload), "SKIPPED")
         await q.message.reply_text("⏭ Пропущено.")
@@ -228,7 +222,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("✅ Одобрено. Машина попала в очередь на публикацию.")
     elif action == "customs":
         context.user_data["await_customs_for"] = int(payload)
-        await q.message.reply_text("💰 Пришли сумму таможни по ТКС в рублях одним числом. Например: <code>612000</code>", parse_mode=ParseMode.HTML)
+        await q.message.reply_text("💰 Пришли сумму таможни в рублях одним числом. Например: <code>612000</code>", parse_mode=ParseMode.HTML)
     elif action == "edit":
         car = DB.get_car(int(payload))
         current = car["post_text"] or generate_post(car)
@@ -250,12 +244,15 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             DB.set_source_card(car_id, source.media_urls, source.description, source.engine_cc, source.engine_type)
             car = DB.get_car(car_id)
             DB.set_car_text(car_id, generate_post(car))
+
             photos = [u for u in source.media_urls if any(x in u.lower() for x in (".jpg", ".jpeg", ".png", ".webp"))][:10]
             if photos:
                 await q.message.reply_media_group(media=[InputMediaPhoto(media=u) for u in photos])
-            await q.message.reply_text(f"✅ Готово: {len(photos)} фото. Описание из карточки сохранено и использовано в тексте.")
             await q.message.reply_text(
-                "📝 <b>Обновлённый текст</b>\n\n" + html.escape(generate_post(DB.get_car(car_id))),
+                f"✅ Готово: {len(photos)} фото. Описание из карточки сохранено и использовано в тексте."
+            )
+            await q.message.reply_text(
+                "📝 <b>Обновлённый текст</b>\n\n" + render_channel_post(DB.get_car(car_id), DB.get_setting("owner_user_id")),
                 parse_mode=ParseMode.HTML,
             )
         except Exception as exc:
@@ -270,8 +267,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update):
-        return
+    if not await guard(update): return
     text = (update.message.text or "").strip()
     if "await_customs_for" in context.user_data:
         car_id = context.user_data.pop("await_customs_for")
@@ -282,19 +278,19 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total = final_price(car["price_cny"], rate, customs, S.extra_cny, S.delivery_rub, S.other_rub)
             DB.set_customs(car_id, customs, rate, total)
             DB.set_car_text(car_id, generate_post(DB.get_car(car_id)))
-            await update.message.reply_text(f"✅ <b>ИТОГОВАЯ ЦЕНА — {rub(total)} ₽</b>", parse_mode=ParseMode.HTML)
-        except Exception as exc:
-            await update.message.reply_text(f"❌ Не получилось посчитать: {exc}")
+            await update.message.reply_text(f"✅ <b>ИТОГОВАЯ ЦЕНА В МОСКВЕ: {rub(total)} ₽</b>", parse_mode=ParseMode.HTML)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Не получилось посчитать: {e}")
         return
     if "await_text_for" in context.user_data:
         car_id = context.user_data.pop("await_text_for")
         DB.set_car_text(car_id, text)
         await update.message.reply_text("✅ Текст сохранён.")
+        return
 
 
 async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update):
-        return
+    if not await guard(update): return
     car_id = context.user_data.pop("await_voice_for", None)
     if not car_id:
         await update.message.reply_text("Сначала открой машину и нажми «🎙 Голос».")
@@ -304,8 +300,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update):
-        return
+    if not await guard(update): return
     if not context.args:
         await update.message.reply_text("Использование: /setchannel @filinkovauto или /setchannel -100123456789")
         return
@@ -316,30 +311,31 @@ async def setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def publish_car(message, context: ContextTypes.DEFAULT_TYPE, car_id: int):
     car = DB.get_car(car_id)
-    if not car or not car["final_price_rub"]:
-        await message.reply_text("💰 Сначала должна быть рассчитана конечная цена.")
+    if not car:
+        await message.reply_text("Машина не найдена.")
         return
     channel = DB.get_setting("channel_id", S.channel_id)
     if not channel:
         await message.reply_text("Сначала задай канал: /setchannel @username_канала")
         return
-    text = car["post_text"] or generate_post(car)
+    text = render_channel_post(car, DB.get_setting("owner_user_id"))
     media = json.loads(car["media_json"] or "[]")
     photos = [u for u in media if any(x in u.lower() for x in (".jpg", ".jpeg", ".png", ".webp"))][:10]
     videos = [u for u in media if any(x in u.lower() for x in (".mp4", ".mov"))][:1]
     try:
         if photos:
-            await context.bot.send_media_group(chat_id=channel, media=[InputMediaPhoto(media=u) for u in photos])
-        await context.bot.send_message(chat_id=channel, text=text)
+            album = [InputMediaPhoto(media=u) for u in photos]
+            await context.bot.send_media_group(chat_id=channel, media=album)
+        await context.bot.send_message(chat_id=channel, text=text, parse_mode=ParseMode.HTML)
         if videos:
             await context.bot.send_video(chat_id=channel, video=videos[0])
         if car["voice_file_id"]:
             await context.bot.send_voice(chat_id=channel, voice=car["voice_file_id"])
         DB.mark_published(car_id)
         await message.reply_text("🚀 Опубликовано в канал.")
-    except Exception as exc:
+    except Exception as e:
         log.exception("Publish failed")
-        await message.reply_text(f"❌ Не получилось опубликовать: {exc}\nПроверь, что бот добавлен администратором канала.")
+        await message.reply_text(f"❌ Не получилось опубликовать: {e}\nПроверь, что бот добавлен администратором канала.")
 
 
 async def scheduled_publish(context: ContextTypes.DEFAULT_TYPE):
@@ -349,17 +345,12 @@ async def scheduled_publish(context: ContextTypes.DEFAULT_TYPE):
     if not approved:
         return
     car = approved[0]
-    if not car["final_price_rub"]:
-        return
     channel = DB.get_setting("channel_id", S.channel_id)
     if not channel:
         return
+    text = render_channel_post(car, DB.get_setting("owner_user_id"))
     try:
-        media = json.loads(car["media_json"] or "[]")
-        photos = [u for u in media if any(x in u.lower() for x in (".jpg", ".jpeg", ".png", ".webp"))][:10]
-        if photos:
-            await context.bot.send_media_group(chat_id=channel, media=[InputMediaPhoto(media=u) for u in photos])
-        await context.bot.send_message(chat_id=channel, text=car["post_text"] or generate_post(car))
+        await context.bot.send_message(chat_id=channel, text=text, parse_mode=ParseMode.HTML)
         DB.mark_published(car["id"])
     except Exception:
         log.exception("Scheduled publish failed")
@@ -367,8 +358,8 @@ async def scheduled_publish(context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(app: Application):
     if S.auto_publish:
-        from datetime import time
         tz = ZoneInfo(S.timezone)
+        from datetime import time
         for hour in S.publish_hours:
             app.job_queue.run_daily(scheduled_publish, time=time(hour=hour, tzinfo=tz), name=f"publish-{hour}")
 
@@ -383,7 +374,6 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, voice_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
