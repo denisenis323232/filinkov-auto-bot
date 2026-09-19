@@ -5,12 +5,14 @@ import io
 import json
 import re
 from datetime import datetime, timedelta, time as dt_time
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.constants import ParseMode
 
 import run_hotfix as h
+from app.ingest_bridge import local_entries, local_folder, read_local, start_ingest_server
 
 p = h.p
 b = p.b
@@ -63,7 +65,7 @@ def _next_slot(items: list[dict]) -> datetime:
 
 
 def _numbered_images(entries: list[dict]) -> list[dict]:
-    """Only accept individual photo slots 01..10. A collage/other filename is ignored."""
+    """Only accept separate photo slots 01..10. Collages/other filenames are ignored."""
     found: dict[int, dict] = {}
     for entry in entries:
         if entry.get(".tag") != "file":
@@ -75,6 +77,20 @@ def _numbered_images(entries: list[dict]) -> list[dict]:
     return [found[n] for n in sorted(found)]
 
 
+def _entry_slot(entry: dict) -> int:
+    m = re.match(r"(\d{2})", str(entry.get("name") or ""))
+    return int(m.group(1)) if m else 0
+
+
+def _read_entry(entry: dict) -> bytes:
+    if entry.get("local_path"):
+        return read_local(entry)
+    if entry.get("remote_url"):
+        raw, _ext = r._download_source(entry["remote_url"], b.S.http_timeout)
+        return raw
+    return r._dbx_download(entry["path_lower"], max(60, b.S.http_timeout))
+
+
 def _manifest_expected(car, jid: str) -> int:
     expected = min(10, len(r._photo_urls(car)))
     if expected:
@@ -82,35 +98,72 @@ def _manifest_expected(car, jid: str) -> int:
     try:
         raw = r._dbx_download(f"{r.DROPBOX_ROOT}/inbox/{jid}/manifest.json", max(60, b.S.http_timeout))
         data = json.loads(raw.decode("utf-8"))
-        return max(0, min(10, int(data.get("expected") or 0)))
+        expected = max(0, min(10, int(data.get("expected") or 0)))
+        if expected:
+            return expected
     except Exception:
-        return 0
+        pass
+    # Selected supplier cards normally contain at least ten images; this is the contract
+    # for the individual-photo workflow when Dropbox metadata is temporarily unavailable.
+    return 10
 
 
 def _ready_files(car):
     jid = r.job_id(car)
-    path = f"{r.DROPBOX_ROOT}/ready/{jid}"
-    files = _numbered_images(r._dbx_list(path))
-    expected = _manifest_expected(car, jid) or min(10, len(files))
-    by_num = {int(str(f.get("name", "00"))[:2]): f for f in files}
-    selected = [by_num[i] for i in range(1, expected + 1) if i in by_num]
-    missing = [i for i in range(1, expected + 1) if i not in by_num]
+    expected = _manifest_expected(car, jid)
+    found: dict[int, dict] = {}
+
+    # Dropbox remains supported, but an expired Dropbox token must not stop the bot.
+    try:
+        for entry in _numbered_images(r._dbx_list(f"{r.DROPBOX_ROOT}/ready/{jid}")):
+            found[_entry_slot(entry)] = entry
+    except Exception as exc:
+        b.log.warning("Dropbox READY unavailable for %s: %s", jid, exc)
+
+    # Direct HTTP bridge slots override Dropbox slots and are always individual files.
+    for entry in local_entries(str(car["inventory_no"] or car["id"])):
+        found[_entry_slot(entry)] = entry
+
+    selected = [found[i] for i in range(1, expected + 1) if i in found]
+    missing = [i for i in range(1, expected + 1) if i not in found]
     return jid, expected, selected, missing
 
 
 def _original_files(car):
     jid = r.job_id(car)
-    path = f"{r.DROPBOX_ROOT}/inbox/{jid}"
-    files = _numbered_images(r._dbx_list(path))
-    expected = _manifest_expected(car, jid) or min(10, len(files))
-    return jid, expected, files[:expected]
+    expected = _manifest_expected(car, jid)
+    try:
+        files = _numbered_images(r._dbx_list(f"{r.DROPBOX_ROOT}/inbox/{jid}"))
+        if files:
+            return jid, expected, files[:expected]
+    except Exception as exc:
+        b.log.warning("Dropbox inbox unavailable for %s: %s", jid, exc)
+
+    urls = r._photo_urls(car)[:expected]
+    files = [
+        {".tag": "file", "name": f"{i:02d}.jpg", "remote_url": url}
+        for i, url in enumerate(urls, 1)
+    ]
+    return jid, expected, files
 
 
 def _media_state_path(jid: str) -> str:
     return f"{r.DROPBOX_ROOT}/ready/{jid}/telegram_media.json"
 
 
-def _load_media_state(jid: str) -> dict:
+def _local_media_state_path(car) -> Path:
+    return local_folder(str(car["inventory_no"] or car["id"])) / "telegram_media.json"
+
+
+def _load_media_state(car, jid: str) -> dict:
+    local_state = _local_media_state_path(car)
+    try:
+        if local_state.exists():
+            value = json.loads(local_state.read_text("utf-8"))
+            if isinstance(value, dict):
+                return value
+    except Exception:
+        pass
     try:
         raw = r._dbx_download(_media_state_path(jid), max(60, b.S.http_timeout))
         value = json.loads(raw.decode("utf-8"))
@@ -119,21 +172,33 @@ def _load_media_state(jid: str) -> dict:
         return {}
 
 
-def _save_media_state(jid: str, car_id: int, file_ids: list[str], notified: bool = True) -> None:
+def _save_media_state(car, jid: str, file_ids: list[str], notified: bool = True) -> None:
     payload = {
         "job_id": jid,
-        "car_id": car_id,
+        "car_id": int(car["id"]),
+        "inventory_no": car["inventory_no"],
         "telegram_file_ids": file_ids,
         "notified": notified,
         "mode": "individual_files_01_to_10",
         "updated_at": datetime.now(TZ).isoformat(),
     }
-    r._dbx_upload(_media_state_path(jid), json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"), timeout=max(60, b.S.http_timeout))
+    raw = json.dumps(payload, ensure_ascii=False, indent=2)
+    try:
+        path = _local_media_state_path(car)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(raw, "utf-8")
+    except Exception:
+        b.log.exception("Could not save local Telegram media state for %s", jid)
+    try:
+        r._dbx_upload(_media_state_path(jid), raw.encode("utf-8"), timeout=max(60, b.S.http_timeout))
+    except Exception as exc:
+        # Dropbox persistence is optional for the bridge; Telegram moderation still works.
+        b.log.warning("Could not persist Telegram media state to Dropbox for %s: %s", jid, exc)
 
 
 def _restore_media_state(car) -> list[str]:
     jid = r.job_id(car)
-    state = _load_media_state(jid)
+    state = _load_media_state(car, jid)
     ids = state.get("telegram_file_ids") or []
     if isinstance(ids, list) and ids:
         ids = [str(x) for x in ids][:10]
@@ -143,7 +208,7 @@ def _restore_media_state(car) -> list[str]:
 
 
 async def _send_ready_album(reply_message, car, files: list[dict], jid: str) -> list[str]:
-    raws = [await asyncio.to_thread(r._dbx_download, f["path_lower"], max(60, b.S.http_timeout)) for f in files]
+    raws = [await asyncio.to_thread(_read_entry, f) for f in files]
     buffers = []
     album = []
     caption = b._caption_html(b.render_channel_post(car, b.DB.get_setting("owner_user_id")))
@@ -157,7 +222,7 @@ async def _send_ready_album(reply_message, car, files: list[dict], jid: str) -> 
         file_ids = [m.photo[-1].file_id for m in sent if m.photo]
         if len(file_ids) == len(files):
             b.DB.set_branded_media(car["id"], file_ids)
-            await asyncio.to_thread(_save_media_state, jid, int(car["id"]), file_ids, True)
+            await asyncio.to_thread(_save_media_state, car, jid, file_ids, True)
         return file_ids
     finally:
         for bio in buffers:
@@ -165,7 +230,7 @@ async def _send_ready_album(reply_message, car, files: list[dict], jid: str) -> 
 
 
 async def _send_ready_album_to_chat(bot, chat_id: int, car, files: list[dict], jid: str) -> list[str]:
-    raws = [await asyncio.to_thread(r._dbx_download, f["path_lower"], max(60, b.S.http_timeout)) for f in files]
+    raws = [await asyncio.to_thread(_read_entry, f) for f in files]
     buffers = []
     album = []
     caption = b._caption_html(b.render_channel_post(car, b.DB.get_setting("owner_user_id")))
@@ -179,7 +244,7 @@ async def _send_ready_album_to_chat(bot, chat_id: int, car, files: list[dict], j
         file_ids = [m.photo[-1].file_id for m in sent if m.photo]
         if len(file_ids) == len(files):
             b.DB.set_branded_media(car["id"], file_ids)
-            await asyncio.to_thread(_save_media_state, jid, int(car["id"]), file_ids, True)
+            await asyncio.to_thread(_save_media_state, car, jid, file_ids, True)
         return file_ids
     finally:
         for bio in buffers:
@@ -196,14 +261,11 @@ async def _import_ready_to_telegram(message, car):
     if len(restored) == expected and expected > 0:
         return restored
 
-    if expected <= 0:
-        await message.reply_text(f"⚠️ Не знаю ожидаемое число фото для ID <code>{jid}</code>.", parse_mode=ParseMode.HTML)
-        return []
     if missing:
         await message.reply_text(
             f"⏳ Готово <b>{len(files)}/{expected}</b> отдельных фото. "
             f"Не хватает: <code>{', '.join(f'{n:02d}' for n in missing)}</code>.\n"
-            "Бот не возьмёт коллаж или файл с другим именем — только 01.jpg … 10.jpg.",
+            "Коллажи бот не принимает — только отдельные 01.jpg … 10.jpg.",
             parse_mode=ParseMode.HTML,
         )
         return []
@@ -220,11 +282,11 @@ async def _ensure_price(car):
 async def _show_originals_separately(message, car):
     jid, expected, files = await asyncio.to_thread(_original_files, car)
     if not files:
-        await message.reply_text(f"Оригиналы ещё не скачаны. ID: <code>{jid}</code>", parse_mode=ParseMode.HTML)
+        await message.reply_text(f"Оригиналы ещё не доступны. ID: <code>{jid}</code>", parse_mode=ParseMode.HTML)
         return
     await message.reply_text(f"📸 {len(files)}/{expected} оригиналов. Отправляю <b>каждую фотографию отдельным сообщением</b>.", parse_mode=ParseMode.HTML)
     for i, entry in enumerate(files, 1):
-        raw = await asyncio.to_thread(r._dbx_download, entry["path_lower"], max(60, b.S.http_timeout))
+        raw = await asyncio.to_thread(_read_entry, entry)
         bio = io.BytesIO(raw)
         bio.name = entry.get("name") or f"{i:02d}.jpg"
         try:
@@ -284,13 +346,13 @@ async def buttons(update, context):
         if not car:
             return
         car, price_error = await _ensure_price(car)
-        jid, expected, _files, missing = await asyncio.to_thread(_ready_files, car)
+        _jid, expected, _files, missing = await asyncio.to_thread(_ready_files, car)
         branded = json.loads(car["branded_media_json"] or "[]") if car else []
         if price_error or not car["final_price_rub"]:
             await q.message.reply_text(f"💰 В очередь не ставлю: цена не готова ({price_error or 'нет итоговой цены'}).")
             return
         if missing:
-            await q.message.reply_text(f"📸 В очередь не ставлю: готово не всё. Не хватает {', '.join(f'{n:02d}' for n in missing)}.")
+            await q.message.reply_text(f"📸 В очередь не ставлю: не хватает {', '.join(f'{n:02d}' for n in missing)}.")
             return
         if len(branded) != expected:
             branded = await _import_ready_to_telegram(q.message, car)
@@ -322,7 +384,7 @@ async def buttons(update, context):
             await q.answer()
             await q.message.reply_text("✅ Сначала нажми «Одобрить». Без согласования публикация заблокирована.")
             return
-        jid, expected, _files, missing = await asyncio.to_thread(_ready_files, car)
+        _jid, expected, _files, missing = await asyncio.to_thread(_ready_files, car)
         branded = json.loads(car["branded_media_json"] or "[]")
         if missing or len(branded) != expected:
             await q.answer()
@@ -331,14 +393,13 @@ async def buttons(update, context):
             if missing or len(branded) != expected:
                 await q.message.reply_text(f"📸 Публикация заблокирована: нужны все {expected or 10} отдельных фото.")
                 return
-        # Let the original handler publish after our approval/photo gate.
         return await _original_buttons(update, context)
 
     await _original_buttons(update, context)
 
 
 async def ready_moderation_tick(context):
-    """When all numbered ready photos exist, send exactly one moderation package. Never publishes."""
+    """When all separate slots exist, send one moderation package. Never auto-publishes."""
     owner = b.DB.get_setting("owner_user_id")
     if not owner:
         return
@@ -358,7 +419,7 @@ async def ready_moderation_tick(context):
             if len(branded) == expected:
                 continue
 
-            state = await asyncio.to_thread(_load_media_state, jid)
+            state = await asyncio.to_thread(_load_media_state, car, jid)
             ids = state.get("telegram_file_ids") or []
             if isinstance(ids, list) and len(ids) == expected:
                 b.DB.set_branded_media(car["id"], [str(x) for x in ids])
@@ -377,7 +438,6 @@ async def ready_moderation_tick(context):
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb_car(int(car["id"])),
             )
-            # One new moderation package per tick to avoid message floods.
             break
         except Exception:
             b.log.exception("Ready moderation import failed for car %s", car["id"])
@@ -402,7 +462,7 @@ async def moderation_tick(context):
         car = b.DB.get_car(car_id)
         if not car or car["status"] != "APPROVED" or not car["final_price_rub"]:
             continue
-        jid, expected, _files, missing = await asyncio.to_thread(_ready_files, car)
+        _jid, expected, _files, missing = await asyncio.to_thread(_ready_files, car)
         branded = json.loads(car["branded_media_json"] or "[]")
         if missing or expected <= 0 or len(branded) != expected:
             continue
@@ -434,11 +494,9 @@ r.kb_car = kb_car
 b.buttons = buttons
 r.b.buttons = buttons
 b.post_init = post_init
-
-# Old background processors/publishers remain disabled. This module only imports completed
-# individual files from ready and puts them in front of the owner for explicit approval.
 r.poll_ready = h.quiet_poll_ready
 h.w.weekly_publish_tick = h.safe_weekly_tick
 
 if __name__ == "__main__":
+    start_ingest_server(b.DB, b.log, b.S.http_timeout)
     b.main()
