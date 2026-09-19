@@ -9,7 +9,7 @@ import time
 
 def main() -> int:
     processor = subprocess.Popen([sys.executable, "run_photo_processor.py"], env=os.environ.copy())
-    bot = subprocess.Popen([sys.executable, "run_persistent_state.py"], env=os.environ.copy())
+    bot = subprocess.Popen([sys.executable, "run_progress.py"], env=os.environ.copy())
 
     def stop(_sig=None, _frame=None):
         for p in (processor, bot):
