@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import html
 import re
+
+PHONE_DISPLAY = "+7 916 408-50-10"
+PHONE_TEL = "+79164085010"
 
 
 def rub(value) -> str:
@@ -65,6 +69,7 @@ def _condition_line(car) -> str | None:
 
 
 def generate_post(car) -> str:
+    """Generate the editable plain-text body. Contacts are added at render time."""
     model = car["model"] or "Автомобиль"
     year = car["year"] or "—"
     power = car["power_hp"] or "—"
@@ -80,7 +85,7 @@ def generate_post(car) -> str:
         "",
         f"{year} год • {mileage} км • {power} л.с.",
         "",
-        f"{model} — хороший вариант для тех, кто ищет живой автомобиль под заказ без лишней переплаты.",
+        f"{model} — интересный вариант под заказ: понятный пробег, нормальная комплектация и подробная карточка от поставщика.",
         f"Комплектация: {trim}.",
     ]
 
@@ -92,18 +97,31 @@ def generate_post(car) -> str:
         lines += [f"— {x}" for x in features]
 
     if final:
-        lines += ["", f"💸 ИТОГОВАЯ ЦЕНА — {rub(final)} ₽"]
+        lines += ["", f"💸 ИТОГОВАЯ ЦЕНА В МОСКВЕ: {rub(final)} ₽"]
     else:
-        lines += ["", "💸 ИТОГОВАЯ ЦЕНА — рассчитывается"]
+        lines += ["", "💸 ИТОГОВАЯ ЦЕНА В МОСКВЕ: рассчитывается"]
 
     lines += [
         "",
         "Если интересен именно этот вариант или нужен похожий автомобиль — напишите. Подберём и посчитаем всё под ключ.",
-        "",
-        "📞 Денис: +7 916 408-50-10",
-        "Или в личные сообщения канала",
     ]
     return "\n".join(lines)
+
+
+def render_channel_post(car, owner_user_id: str | int | None) -> str:
+    """Escape editable body and append clickable contact footer for Telegram HTML."""
+    body = car["post_text"] or generate_post(car)
+    body_html = html.escape(str(body))
+
+    footer = [
+        "",
+        f'📞 Денис: <a href="tel:{PHONE_TEL}">{PHONE_DISPLAY}</a>',
+    ]
+    if owner_user_id:
+        footer.append(f'💬 <a href="tg://user?id={int(owner_user_id)}">Личные сообщения</a>')
+    else:
+        footer.append("💬 Личные сообщения")
+    return body_html + "\n" + "\n".join(footer)
 
 
 def generate_voice_script(car) -> str:
@@ -112,5 +130,5 @@ def generate_voice_script(car) -> str:
         f"Друзья, посмотрите на {model}. "
         f"{car['year']} год, {car['power_hp']} сил, пробег {rub(car['mileage_km'])} километров. "
         "По карточке поставщика состояние и оснащение выглядят интересно. "
-        "Если хотите такой вариант, напишите мне — посчитаем конечную цену и привезём под заказ."
+        "Если хотите такой вариант, напишите мне — посчитаем конечную цену в Москве и привезём под заказ."
     )
