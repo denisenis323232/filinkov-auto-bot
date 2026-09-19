@@ -6,13 +6,14 @@ import time
 
 
 def main() -> int:
-    # One-shot staging of currently selected cars that were missing in Dropbox.
-    # Safe to rerun: files are overwritten with the same originals.
-    stage = subprocess.run([sys.executable, "stage_missing_selected.py"], check=False)
+    # Stage the current 14 selected cars into the bot database and Dropbox inbox.
+    # Originals are always separate numbered files (01..10). No image processing here.
+    stage = subprocess.run([sys.executable, "stage_selected_14.py"], check=False)
     if stage.returncode != 0:
-        print(f"WARNING: staging returned {stage.returncode}; starting moderation bot anyway", flush=True)
+        print(f"WARNING: selected staging returned {stage.returncode}; starting moderation bot anyway", flush=True)
 
-    # ChatGPT prepares/edits photos. Railway bot only moderates, queues and publishes.
+    # Railway only stages originals, imports completed individual READY files,
+    # moderates, queues and publishes after explicit approval.
     bot = subprocess.Popen([sys.executable, "run_moderation.py"])
     try:
         while True:
