@@ -3,14 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
+import io
 import json
 import logging
 import os
 import re
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote
 
 import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
@@ -23,7 +21,8 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 ROOT = b.S.data_dir / "cloud_jobs"
 ROOT.mkdir(parents=True, exist_ok=True)
-PORT = int(os.getenv("PORT", "8080"))
+DROPBOX_ROOT = "/FILINKOV_AUTO"
+DROPBOX_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN", "").strip()
 
 _original_post_init = b.post_init
 
@@ -53,141 +52,131 @@ def _is_photo(url: str) -> bool:
     return any(x in low for x in (".jpg", ".jpeg", ".png", ".webp"))
 
 
-def _download_photo(url: str, target_base: Path, timeout: int) -> Path:
-    r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 FILINKOV-AUTO/1.0"})
+def _require_dropbox():
+    if not DROPBOX_TOKEN:
+        raise RuntimeError("DROPBOX_ACCESS_TOKEN не настроен")
+
+
+def _dbx_api(endpoint: str, payload: dict, timeout: int = 30):
+    _require_dropbox()
+    r = requests.post(
+        f"https://api.dropboxapi.com/2/{endpoint}",
+        headers={"Authorization": f"Bearer {DROPBOX_TOKEN}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=timeout,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"Dropbox {endpoint}: HTTP {r.status_code}: {r.text[:300]}")
+    return r.json() if r.content else {}
+
+
+def _dbx_create_folder(path: str):
+    _require_dropbox()
+    r = requests.post(
+        "https://api.dropboxapi.com/2/files/create_folder_v2",
+        headers={"Authorization": f"Bearer {DROPBOX_TOKEN}", "Content-Type": "application/json"},
+        json={"path": path, "autorename": False},
+        timeout=30,
+    )
+    if r.status_code == 409 and "conflict" in r.text.lower():
+        return
+    if r.status_code >= 400:
+        raise RuntimeError(f"Dropbox create_folder: HTTP {r.status_code}: {r.text[:300]}")
+
+
+def _dbx_upload(path: str, raw: bytes):
+    _require_dropbox()
+    arg = {"path": path, "mode": "overwrite", "autorename": False, "mute": True, "strict_conflict": False}
+    r = requests.post(
+        "https://content.dropboxapi.com/2/files/upload",
+        headers={
+            "Authorization": f"Bearer {DROPBOX_TOKEN}",
+            "Content-Type": "application/octet-stream",
+            "Dropbox-API-Arg": json.dumps(arg, ensure_ascii=True),
+        },
+        data=raw,
+        timeout=max(60, b.S.http_timeout),
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"Dropbox upload: HTTP {r.status_code}: {r.text[:300]}")
+
+
+def _dbx_list(path: str) -> list[dict]:
+    try:
+        data = _dbx_api("files/list_folder", {"path": path, "recursive": False, "include_deleted": False}, timeout=30)
+    except RuntimeError as exc:
+        if "path/not_found" in str(exc).lower() or "not_found" in str(exc).lower():
+            return []
+        raise
+    entries = list(data.get("entries") or [])
+    while data.get("has_more"):
+        data = _dbx_api("files/list_folder/continue", {"cursor": data["cursor"]}, timeout=30)
+        entries.extend(data.get("entries") or [])
+    return entries
+
+
+def _dbx_download(path: str) -> bytes:
+    _require_dropbox()
+    r = requests.post(
+        "https://content.dropboxapi.com/2/files/download",
+        headers={
+            "Authorization": f"Bearer {DROPBOX_TOKEN}",
+            "Dropbox-API-Arg": json.dumps({"path": path}, ensure_ascii=True),
+        },
+        timeout=max(60, b.S.http_timeout),
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"Dropbox download: HTTP {r.status_code}: {r.text[:300]}")
+    return r.content
+
+
+def _download_source(url: str) -> tuple[bytes, str]:
+    r = requests.get(url, timeout=b.S.http_timeout, headers={"User-Agent": "Mozilla/5.0 FILINKOV-AUTO/1.0"})
     r.raise_for_status()
     ct = (r.headers.get("content-type") or "image/jpeg").split(";")[0].lower()
     ext = ".png" if "png" in ct else ".webp" if "webp" in ct else ".jpg"
-    path = target_base.with_suffix(ext)
-    path.write_bytes(r.content)
-    return path
+    return r.content, ext
 
 
 def stage_car(car) -> tuple[str, int]:
     jid = job_id(car)
-    folder = ROOT / jid
-    inbox = folder / "inbox"
-    ready = folder / "ready"
-    inbox.mkdir(parents=True, exist_ok=True)
-    ready.mkdir(parents=True, exist_ok=True)
+    local = ROOT / jid
+    local.mkdir(parents=True, exist_ok=True)
+
+    inbox_path = f"{DROPBOX_ROOT}/inbox/{jid}"
+    ready_path = f"{DROPBOX_ROOT}/ready/{jid}"
+    _dbx_create_folder(DROPBOX_ROOT)
+    _dbx_create_folder(f"{DROPBOX_ROOT}/inbox")
+    _dbx_create_folder(f"{DROPBOX_ROOT}/ready")
+    _dbx_create_folder(inbox_path)
+    _dbx_create_folder(ready_path)
 
     media = json.loads(car["media_json"] or "[]")
     photos = [u for u in media if _is_photo(u)][:10]
-    existing = sorted([p for p in inbox.iterdir() if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}])
+    existing_names = {e.get("name") for e in _dbx_list(inbox_path) if e.get(".tag") == "file"}
 
-    if len(existing) < len(photos):
-        for old in existing:
-            old.unlink(missing_ok=True)
-        for i, url in enumerate(photos, 1):
-            _download_photo(url, inbox / f"{i:02d}", b.S.http_timeout)
+    for i, url in enumerate(photos, 1):
+        prefix = f"{i:02d}."
+        if any((name or "").startswith(prefix) for name in existing_names):
+            continue
+        raw, ext = _download_source(url)
+        _dbx_upload(f"{inbox_path}/{i:02d}{ext}", raw)
 
     manifest = {
         "job_id": jid,
         "car_id": int(car["id"]),
+        "source_key": car["source_key"],
         "inventory_no": car["inventory_no"],
         "model": car["model"],
         "source_url": car["source_url"],
         "expected": len(photos),
+        "inbox": inbox_path,
+        "ready": ready_path,
     }
-    (folder / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    manifest_raw = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+    _dbx_upload(f"{inbox_path}/manifest.json", manifest_raw)
+    (local / "manifest.json").write_bytes(manifest_raw)
     return jid, len(photos)
-
-
-def _json_response(handler: BaseHTTPRequestHandler, payload, status=200):
-    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    handler.send_response(status)
-    handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Content-Length", str(len(raw)))
-    handler.send_header("Cache-Control", "no-store")
-    handler.end_headers()
-    handler.wfile.write(raw)
-
-
-class BridgeHandler(BaseHTTPRequestHandler):
-    server_version = "FILINKOVCloud/1.0"
-
-    def log_message(self, fmt, *args):
-        logging.getLogger("filinkov-cloud").info("%s - %s", self.address_string(), fmt % args)
-
-    def do_GET(self):
-        path = unquote(self.path.split("?", 1)[0])
-        if path == "/health":
-            return _json_response(self, {"ok": True})
-        if path == "/jobs":
-            jobs = []
-            for folder in sorted(ROOT.iterdir() if ROOT.exists() else []):
-                mf = folder / "manifest.json"
-                if not folder.is_dir() or not mf.exists():
-                    continue
-                try:
-                    item = json.loads(mf.read_text(encoding="utf-8"))
-                except Exception:
-                    continue
-                item["inbox_count"] = len(list((folder / "inbox").glob("*"))) if (folder / "inbox").exists() else 0
-                item["ready_count"] = len(list((folder / "ready").glob("*"))) if (folder / "ready").exists() else 0
-                item["imported"] = (folder / "imported.flag").exists()
-                jobs.append(item)
-            return _json_response(self, {"jobs": jobs})
-
-        m = re.fullmatch(r"/jobs/([^/]+)/(inbox|ready)/([^/]+)", path)
-        if m:
-            jid, side, name = m.groups()
-            if not re.fullmatch(r"[0-9A-Za-zА-Яа-я_-]+", jid) or not re.fullmatch(r"[0-9A-Za-z_.-]+", name):
-                return _json_response(self, {"error": "bad path"}, 400)
-            file_path = ROOT / jid / side / name
-            if not file_path.exists() or not file_path.is_file():
-                return _json_response(self, {"error": "not found"}, 404)
-            raw = file_path.read_bytes()
-            suffix = file_path.suffix.lower()
-            ctype = "image/png" if suffix == ".png" else "image/webp" if suffix == ".webp" else "image/jpeg"
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(raw)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(raw)
-            return
-
-        m = re.fullmatch(r"/jobs/([^/]+)", path)
-        if m:
-            jid = m.group(1)
-            mf = ROOT / jid / "manifest.json"
-            if not mf.exists():
-                return _json_response(self, {"error": "not found"}, 404)
-            item = json.loads(mf.read_text(encoding="utf-8"))
-            inbox = ROOT / jid / "inbox"
-            ready = ROOT / jid / "ready"
-            item["inbox"] = sorted(p.name for p in inbox.iterdir() if p.is_file()) if inbox.exists() else []
-            item["ready"] = sorted(p.name for p in ready.iterdir() if p.is_file()) if ready.exists() else []
-            item["imported"] = (ROOT / jid / "imported.flag").exists()
-            return _json_response(self, item)
-
-        return _json_response(self, {"error": "not found"}, 404)
-
-    def do_POST(self):
-        path = unquote(self.path.split("?", 1)[0])
-        m = re.fullmatch(r"/jobs/([^/]+)/ready/([^/]+)", path)
-        if not m:
-            return _json_response(self, {"error": "not found"}, 404)
-        jid, name = m.groups()
-        if not re.fullmatch(r"[0-9A-Za-zА-Яа-я_-]+", jid) or not re.fullmatch(r"[0-9A-Za-z_.-]+", name):
-            return _json_response(self, {"error": "bad path"}, 400)
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0 or length > 25 * 1024 * 1024:
-            return _json_response(self, {"error": "bad size"}, 400)
-        raw = self.rfile.read(length)
-        ready = ROOT / jid / "ready"
-        ready.mkdir(parents=True, exist_ok=True)
-        target = ready / name
-        target.write_bytes(raw)
-        return _json_response(self, {"ok": True, "job_id": jid, "name": name, "size": len(raw)})
-
-
-def start_bridge():
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), BridgeHandler)
-    thread = threading.Thread(target=server.serve_forever, name="media-cloud", daemon=True)
-    thread.start()
-    logging.getLogger("filinkov-cloud").info("Cloud bridge listening on port %s", PORT)
 
 
 async def _ensure_source(car):
@@ -208,8 +197,8 @@ async def send_car(message, car):
         try:
             jid, count = await asyncio.to_thread(stage_car, car)
         except Exception as exc:
-            b.log.exception("Could not stage cloud job")
-            await message.reply_text(f"⚠️ Не смог выгрузить фото в облако: {type(exc).__name__}: {exc}")
+            b.log.exception("Could not stage Dropbox job")
+            await message.reply_text(f"⚠️ Не смог выгрузить фото в Dropbox: {type(exc).__name__}: {exc}")
             count = 0
     else:
         count = len(branded)
@@ -231,13 +220,18 @@ async def send_car(message, car):
     if branded:
         await b.send_post_preview(message, car)
     elif count:
-        await message.reply_text(f"☁️ {count} фото выгружены в облако. Жду готовые файлы по ID <code>{jid}</code>.", parse_mode=ParseMode.HTML)
+        await message.reply_text(
+            f"☁️ {count} фото лежат в Dropbox: <code>/FILINKOV_AUTO/inbox/{html.escape(jid)}</code>\n"
+            f"Готовые положи в <code>/FILINKOV_AUTO/ready/{html.escape(jid)}</code> — бот заберёт их сам.",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 async def poll_ready(context):
     owner = b.DB.get_setting("owner_user_id")
-    if not owner:
+    if not owner or not DROPBOX_TOKEN:
         return
+
     for folder in sorted(ROOT.iterdir() if ROOT.exists() else []):
         if not folder.is_dir() or (folder / "imported.flag").exists():
             continue
@@ -248,39 +242,61 @@ async def poll_ready(context):
             manifest = json.loads(mf.read_text(encoding="utf-8"))
             expected = int(manifest.get("expected") or 0)
             car_id = int(manifest["car_id"])
+            ready_path = manifest["ready"]
         except Exception:
             continue
-        ready = folder / "ready"
-        files = sorted([p for p in ready.iterdir() if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]) if ready.exists() else []
+
+        try:
+            entries = await asyncio.to_thread(_dbx_list, ready_path)
+        except Exception:
+            b.log.exception("Could not list Dropbox ready folder for %s", folder.name)
+            continue
+
+        files = [
+            e for e in entries
+            if e.get(".tag") == "file" and str(e.get("name") or "").lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+        ]
+        files.sort(key=lambda e: e.get("name") or "")
         if expected <= 0 or len(files) < expected:
             continue
         files = files[:expected]
+
         car = b.DB.get_car(car_id)
         if not car:
             continue
 
-        handles = [open(p, "rb") for p in files]
+        buffers = []
         try:
+            for e in files:
+                raw = await asyncio.to_thread(_dbx_download, e["path_lower"])
+                bio = io.BytesIO(raw)
+                bio.name = e.get("name") or "photo.jpg"
+                buffers.append(bio)
+
             caption = b._caption_html(b.render_channel_post(car, owner))
-            album = [InputMediaPhoto(media=handles[0], caption=caption, parse_mode=ParseMode.HTML)]
-            album.extend(InputMediaPhoto(media=h) for h in handles[1:])
+            album = [InputMediaPhoto(media=buffers[0], caption=caption, parse_mode=ParseMode.HTML)]
+            album.extend(InputMediaPhoto(media=h) for h in buffers[1:])
             sent = await context.bot.send_media_group(chat_id=int(owner), media=album)
             file_ids = [m.photo[-1].file_id for m in sent if m.photo]
             if file_ids:
                 b.DB.set_branded_media(car_id, file_ids)
                 (folder / "imported.flag").write_text("ok", encoding="utf-8")
+                await asyncio.to_thread(_dbx_upload, f"{ready_path}/imported.flag", b"ok")
                 await context.bot.send_message(chat_id=int(owner), text=f"✅ Фото FILINKOV готовы и привязаны к машине. ID: {folder.name}")
         except Exception:
-            b.log.exception("Could not import ready cloud photos for %s", folder.name)
+            b.log.exception("Could not import ready Dropbox photos for %s", folder.name)
         finally:
-            for h in handles:
-                h.close()
+            for bio in buffers:
+                bio.close()
 
 
 async def post_init(app):
     await _original_post_init(app)
-    start_bridge()
-    app.job_queue.run_repeating(poll_ready, interval=15, first=5, name="cloud-ready-poller")
+    if DROPBOX_TOKEN:
+        app.job_queue.run_repeating(poll_ready, interval=15, first=5, name="dropbox-ready-poller")
+        logging.getLogger("filinkov-dropbox").info("Dropbox workflow enabled")
+    else:
+        logging.getLogger("filinkov-dropbox").warning("DROPBOX_ACCESS_TOKEN is missing")
 
 
 b.kb_car = kb_car
