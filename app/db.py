@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS cars (
   post_text TEXT,
   voice_file_id TEXT,
   media_json TEXT,
+  branded_media_json TEXT,
   source_description TEXT,
   engine_cc INTEGER,
   engine_type TEXT,
@@ -67,6 +68,7 @@ class Database:
                 "source_description": "TEXT",
                 "engine_cc": "INTEGER",
                 "engine_type": "TEXT",
+                "branded_media_json": "TEXT",
             }.items():
                 if name not in cols:
                     con.execute(f"ALTER TABLE cars ADD COLUMN {name} {ddl}")
@@ -157,6 +159,13 @@ class Database:
     def set_media(self, car_id: int, media_urls: list[str]):
         with self.connect() as con:
             con.execute("UPDATE cars SET media_json=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (json.dumps(media_urls, ensure_ascii=False), car_id))
+
+    def set_branded_media(self, car_id: int, telegram_file_ids: list[str]):
+        with self.connect() as con:
+            con.execute(
+                "UPDATE cars SET branded_media_json=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (json.dumps(telegram_file_ids, ensure_ascii=False), car_id),
+            )
 
     def set_voice(self, car_id: int, file_id: str):
         with self.connect() as con:
