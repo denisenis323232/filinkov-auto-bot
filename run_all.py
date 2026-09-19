@@ -6,8 +6,13 @@ import time
 
 
 def main() -> int:
-    # New architecture: ChatGPT prepares/edits photos. Railway bot only moderates,
-    # queues and publishes. No automatic image processor runs here.
+    # One-shot staging of currently selected cars that were missing in Dropbox.
+    # Safe to rerun: files are overwritten with the same originals.
+    stage = subprocess.run([sys.executable, "stage_missing_selected.py"], check=False)
+    if stage.returncode != 0:
+        print(f"WARNING: staging returned {stage.returncode}; starting moderation bot anyway", flush=True)
+
+    # ChatGPT prepares/edits photos. Railway bot only moderates, queues and publishes.
     bot = subprocess.Popen([sys.executable, "run_moderation.py"])
     try:
         while True:
