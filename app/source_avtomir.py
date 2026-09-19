@@ -128,15 +128,41 @@ def _engine_cc(text: str) -> int | None:
 
 
 def _engine_type(text: str) -> str | None:
-    t = text.lower()
-    if "дизел" in t or "diesel" in t:
-        return "diesel"
-    if "гибрид" in t or "hybrid" in t:
-        return "hybrid"
-    if "электр" in t or "electric" in t:
+    """Detect propulsion only from explicit fuel/powertrain wording.
+
+    Do not treat generic words like 'electric seat', 'electric tailgate', etc.
+    as evidence that the whole vehicle is an EV.
+    """
+    t = re.sub(r"\s+", " ", (text or "").lower())
+
+    # Explicit pure-EV markers only.
+    ev_patterns = [
+        r"\b(?:battery electric vehicle|battery electric|bev)\b",
+        r"\b(?:pure electric|fully electric|all[- ]electric)\b",
+        r"(?:fuel|fuel type|powertrain|energy type)\s*[:：]?\s*(?:electric|bev)",
+        r"(?:топливо|тип топлива|силовая установка)\s*[:：]?\s*(?:электро|электрическ)",
+        r"(?:能源类型|燃料形式|动力类型|能源)\s*[:：]?\s*(?:纯电动|纯电)",
+        r"纯电动|纯电汽车|电动汽车",
+    ]
+    if any(re.search(p, t, re.I) for p in ev_patterns):
         return "electric"
-    if "бенз" in t or "gasoline" in t or "petrol" in t:
+
+    hybrid_patterns = [
+        r"\b(?:hybrid|phev|hev)\b",
+        r"гибрид",
+        r"混合动力|油电混合|插电式混合动力",
+    ]
+    if any(re.search(p, t, re.I) for p in hybrid_patterns):
+        return "hybrid"
+
+    diesel_patterns = [r"\bdiesel\b", r"дизел", r"柴油"]
+    if any(re.search(p, t, re.I) for p in diesel_patterns):
+        return "diesel"
+
+    petrol_patterns = [r"\b(?:gasoline|petrol)\b", r"бенз", r"汽油"]
+    if any(re.search(p, t, re.I) for p in petrol_patterns):
         return "petrol"
+
     return None
 
 
