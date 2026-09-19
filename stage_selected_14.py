@@ -33,14 +33,16 @@ CARS = [
 
 
 def dbx_rpc(endpoint: str, payload: dict):
-    r = requests.post(
+    if not DROPBOX_TOKEN:
+        raise RuntimeError("DROPBOX_ACCESS_TOKEN unavailable")
+    resp = requests.post(
         f"https://api.dropboxapi.com/2/{endpoint}",
         headers={"Authorization": f"Bearer {DROPBOX_TOKEN}", "Content-Type": "application/json"},
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), timeout=TIMEOUT,
     )
-    if r.status_code >= 400:
-        raise RuntimeError(f"Dropbox {endpoint}: {r.status_code} {r.text[:300]}")
-    return r.json()
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Dropbox {endpoint}: {resp.status_code} {resp.text[:300]}")
+    return resp.json()
 
 
 def ensure_folder(path: str):
@@ -69,7 +71,9 @@ def list_folder(path: str):
 
 
 def upload(path: str, raw: bytes):
-    r = requests.post(
+    if not DROPBOX_TOKEN:
+        raise RuntimeError("DROPBOX_ACCESS_TOKEN unavailable")
+    resp = requests.post(
         "https://content.dropboxapi.com/2/files/upload",
         headers={
             "Authorization": f"Bearer {DROPBOX_TOKEN}",
@@ -78,33 +82,31 @@ def upload(path: str, raw: bytes):
         },
         data=raw, timeout=max(60, TIMEOUT),
     )
-    if r.status_code >= 400:
-        raise RuntimeError(f"Dropbox upload: {r.status_code} {r.text[:300]}")
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Dropbox upload: {resp.status_code} {resp.text[:300]}")
 
 
 def download_image(url: str):
-    r = requests.get(url, timeout=TIMEOUT, headers={"User-Agent": "Mozilla/5.0 FILINKOV-AUTO/1.0"})
-    r.raise_for_status()
-    ct = (r.headers.get("content-type") or "image/jpeg").lower()
+    resp = requests.get(url, timeout=TIMEOUT, headers={"User-Agent": "Mozilla/5.0 FILINKOV-AUTO/1.0"})
+    resp.raise_for_status()
+    ct = (resp.headers.get("content-type") or "image/jpeg").lower()
     ext = ".png" if "png" in ct else ".webp" if "webp" in ct else ".jpg"
-    return r.content, ext
+    return resp.content, ext
 
 
 def numbered(entries):
     out = {}
-    for e in entries:
-        if e.get(".tag") != "file":
+    for entry in entries:
+        if entry.get(".tag") != "file":
             continue
-        m = re.fullmatch(r"(0[1-9]|10)\.(jpg|jpeg|png|webp)", str(e.get("name", "")).lower())
-        if m:
-            out[int(m.group(1))] = e
+        match = re.fullmatch(r"(0[1-9]|10)\.(jpg|jpeg|png|webp)", str(entry.get("name", "")).lower())
+        if match:
+            out[int(match.group(1))] = entry
     return out
 
 
 def main():
-    if not DROPBOX_TOKEN:
-        raise RuntimeError("DROPBOX_ACCESS_TOKEN missing")
-
+    loaded = 0
     for pos, src in enumerate(CARS, 1):
         row = {
             "source_key": src["source_url"],
@@ -127,44 +129,52 @@ def main():
             "post_text": None,
         }
         car_id = b.DB.upsert_car(row)
+        loaded += 1
 
-        card = extract_card(src["source_url"], TIMEOUT)
-        b.DB.set_source_card(car_id, card.media_urls, card.description, card.engine_cc, card.engine_type)
-        car = b.DB.get_car(car_id)
-        b.DB.set_car_text(car_id, b.generate_post(car))
-
-        photos = [u for u in card.media_urls if any(x in u.lower() for x in (".jpg", ".jpeg", ".png", ".webp"))][:10]
-        if not photos:
-            raise RuntimeError(f"No photos for {src['model']} {src['source_url']}")
+        photos = []
+        try:
+            card = extract_card(src["source_url"], TIMEOUT)
+            b.DB.set_source_card(car_id, card.media_urls, card.description, card.engine_cc, card.engine_type)
+            car = b.DB.get_car(car_id)
+            b.DB.set_car_text(car_id, b.generate_post(car))
+            photos = [u for u in card.media_urls if any(x in u.lower() for x in (".jpg", ".jpeg", ".png", ".webp"))][:10]
+        except Exception as exc:
+            print(f"WARNING source enrichment {src['inventory_no']}: {type(exc).__name__}: {exc}", flush=True)
 
         suffix = hashlib.sha1(src["source_url"].encode("utf-8")).hexdigest()[:8]
         jid = f'{src["inventory_no"]}-{suffix}'
-        inbox = f"{DROPBOX_ROOT}/inbox/{jid}"
-        ready = f"{DROPBOX_ROOT}/ready/{jid}"
-        ensure_folder(inbox)
-        ensure_folder(ready)
 
-        existing = numbered(list_folder(inbox))
-        for i, url in enumerate(photos, 1):
-            if i in existing:
-                continue
-            raw, ext = download_image(url)
-            upload(f"{inbox}/{i:02d}{ext}", raw)
+        if photos and DROPBOX_TOKEN:
+            try:
+                inbox = f"{DROPBOX_ROOT}/inbox/{jid}"
+                ready = f"{DROPBOX_ROOT}/ready/{jid}"
+                ensure_folder(inbox)
+                ensure_folder(ready)
+                existing = numbered(list_folder(inbox))
+                for i, url in enumerate(photos, 1):
+                    if i in existing:
+                        continue
+                    raw, ext = download_image(url)
+                    upload(f"{inbox}/{i:02d}{ext}", raw)
+                manifest = {
+                    "job_id": jid,
+                    "car_id": car_id,
+                    "selection_position": pos,
+                    "inventory_no": src["inventory_no"],
+                    "model": src["model"],
+                    "expected": len(photos),
+                    "source_url": src["source_url"],
+                    "branding": "individual-photo-edit",
+                    "state": "waiting_ready_photos",
+                    "rule": "ready must contain individual files 01..10; no collages",
+                }
+                upload(f"{inbox}/manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
+            except Exception as exc:
+                print(f"WARNING Dropbox stage {jid}: {type(exc).__name__}: {exc}", flush=True)
 
-        manifest = {
-            "job_id": jid,
-            "car_id": car_id,
-            "selection_position": pos,
-            "inventory_no": src["inventory_no"],
-            "model": src["model"],
-            "expected": len(photos),
-            "source_url": src["source_url"],
-            "branding": "individual-photo-edit",
-            "state": "waiting_ready_photos",
-            "rule": "ready must contain individual files 01..10; no collages",
-        }
-        upload(f"{inbox}/manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
-        print(f"SELECTED {pos:02d}/14 {jid} originals={len(photos)}", flush=True)
+        print(f"SELECTED {pos:02d}/14 {jid} source_photos={len(photos)}", flush=True)
+
+    print(f"SELECTED_SET_READY {loaded}/14", flush=True)
 
 
 if __name__ == "__main__":
