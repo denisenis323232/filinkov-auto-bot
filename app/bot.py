@@ -1,28 +1,22 @@
 from __future__ import annotations
-
 import html
 import json
 import logging
-from datetime import time
 from zoneinfo import ZoneInfo
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
 )
 
 from .config import load_settings
 from .db import Database
 from .excel_parser import parse_excel
 from .pricing import fetch_cny_rub, final_price
-from .source_avtomir import extract_media_urls
-from .texts import cny, generate_post, generate_voice_script, rub
+from .source_avtomir import extract_card
+from .texts import generate_post, generate_voice_script, rub
 
 log = logging.getLogger("filinkov-auto")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -48,8 +42,6 @@ def kb_car(car_id: int):
 
 
 def is_admin(user_id: int) -> bool:
-    if S.owner_user_id is not None:
-        return user_id == S.owner_user_id
     owner = DB.get_setting("owner_user_id")
     if owner is None:
         DB.set_setting("owner_user_id", str(user_id))
@@ -73,7 +65,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "🚗 <b>FILINKOV AUTO — контент-менеджер</b>\n\n"
-        "Пришли Excel поставщика. Я отфильтрую машины, соберу очередь и подготовлю карточки к публикации.",
+        "Пришли Excel поставщика. Я отфильтрую машины, заберу описание и первые 10 фото из карточки и подготовлю пост.",
         parse_mode=ParseMode.HTML,
         reply_markup=kb_home(),
     )
@@ -125,23 +117,49 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_car(message, car):
+    if car["source_url"] and not car["source_description"]:
+        try:
+            source = extract_card(car["source_url"], S.http_timeout)
+            DB.set_source_card(car["id"], source.media_urls, source.description, source.engine_cc, source.engine_type)
+            car = DB.get_car(car["id"])
+        except Exception:
+            log.exception("Source enrichment failed for car %s", car["id"])
+
     model = html.escape(car["model"] or "—")
     inventory = html.escape(car["inventory_no"] or "—")
     trim = html.escape(car["trim"] or "—")
     month_text = html.escape(str(car["month_text"] or car["year"] or "—"))
+
+    price = (
+        f"\n💸 <b>ИТОГОВАЯ ЦЕНА — {rub(car['final_price_rub'])} ₽</b>\n"
+        if car["final_price_rub"] else
+        "\n💸 <b>ИТОГОВАЯ ЦЕНА — ещё не рассчитана</b>\n"
+    )
+
     text = (
         f"🚗 <b>{model}</b>\n"
-        f"ID: <code>{car['id']}</code> | № {inventory}\n\n"
-        f"Год: {month_text}\n"
+        f"№ {inventory}\n\n"
+        f"{month_text}\n"
         f"Пробег: {rub(car['mileage_km'])} км\n"
         f"Мощность: {car['power_hp'] or '—'} л.с.\n"
         f"Комплектация: {trim}\n"
-        f"Цена Китай: {cny(car['price_cny'])}\n"
-        f"Таможня: {rub(car['customs_rub'])} ₽\n"
-        f"Итог: <b>{rub(car['final_price_rub'])} ₽</b>\n\n"
+        f"{price}\n"
         f"Статус: <b>{html.escape(car['status'])}</b>"
     )
     await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_car(car["id"]), disable_web_page_preview=True)
+
+    media = json.loads(car["media_json"] or "[]")
+    photos = [u for u in media if any(x in u.lower() for x in (".jpg", ".jpeg", ".png", ".webp"))][:10]
+    if photos:
+        try:
+            await message.reply_media_group(media=[InputMediaPhoto(media=u) for u in photos])
+        except Exception:
+            log.exception("Could not preview photos for car %s", car["id"])
+
+    await message.reply_text(
+        "📝 <b>Черновик поста</b>\n\n" + html.escape(car["post_text"] or generate_post(car)),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def queue_from(message, offset: int = 0):
@@ -160,43 +178,6 @@ async def stats(message):
     for key, value in counts.items():
         lines.append(f"{labels.get(key, key)}: <b>{value}</b>")
     await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
-async def publish_car(message, context: ContextTypes.DEFAULT_TYPE, car_id: int, silent: bool = False):
-    car = DB.get_car(car_id)
-    if not car:
-        if not silent:
-            await message.reply_text("Машина не найдена.")
-        return False
-
-    channel = DB.get_setting("channel_id", S.channel_id)
-    if not channel:
-        if not silent:
-            await message.reply_text("Сначала задай канал: /setchannel @username_канала")
-        return False
-
-    text = car["post_text"] or generate_post(car)
-    media = json.loads(car["media_json"] or "[]")
-    photos = [u for u in media if any(x in u.lower() for x in (".jpg", ".jpeg", ".png", ".webp"))][:10]
-    videos = [u for u in media if any(x in u.lower() for x in (".mp4", ".mov"))][:1]
-
-    try:
-        if photos:
-            await context.bot.send_media_group(chat_id=channel, media=[InputMediaPhoto(media=u) for u in photos])
-        await context.bot.send_message(chat_id=channel, text=text)
-        if videos:
-            await context.bot.send_video(chat_id=channel, video=videos[0])
-        if car["voice_file_id"]:
-            await context.bot.send_voice(chat_id=channel, voice=car["voice_file_id"])
-        DB.mark_published(car_id)
-        if not silent:
-            await message.reply_text("🚀 Опубликовано в канал.")
-        return True
-    except Exception as exc:
-        log.exception("Publish failed")
-        if not silent:
-            await message.reply_text(f"❌ Не получилось опубликовать: {exc}\nПроверь, что бот добавлен администратором канала.")
-        return False
 
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -219,8 +200,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Канал: <code>{html.escape(channel)}</code>\n"
             f"Возраст: {S.min_age_years}–{S.max_age_years} лет\n"
             f"Макс. мощность: {S.max_power_hp} л.с.\n"
-            f"Публикации: {', '.join(map(str, S.publish_hours))}:00 ({S.timezone})\n\n"
-            "Канал можно задать командой:\n<code>/setchannel @filinkovauto</code>",
+            f"Публикации: {', '.join(map(str, S.publish_hours))}:00 ({S.timezone})",
             parse_mode=ParseMode.HTML,
         )
     elif action == "next":
@@ -240,13 +220,15 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "approve":
         car_id = int(payload)
         car = DB.get_car(car_id)
-        if not car["post_text"]:
-            DB.set_car_text(car_id, generate_post(car))
+        if not car["final_price_rub"]:
+            await q.message.reply_text("💰 Сначала нужна конечная цена. Нажми «Таможня» — после расчёта в посте будет только одна итоговая цена.")
+            return
+        DB.set_car_text(car_id, generate_post(car))
         DB.set_car_status(car_id, "APPROVED")
         await q.message.reply_text("✅ Одобрено. Машина попала в очередь на публикацию.")
     elif action == "customs":
         context.user_data["await_customs_for"] = int(payload)
-        await q.message.reply_text("💰 Пришли сумму таможни в рублях одним числом. Например: <code>612000</code>", parse_mode=ParseMode.HTML)
+        await q.message.reply_text("💰 Пришли сумму таможни по ТКС в рублях одним числом. Например: <code>612000</code>", parse_mode=ParseMode.HTML)
     elif action == "edit":
         car = DB.get_car(int(payload))
         current = car["post_text"] or generate_post(car)
@@ -262,18 +244,28 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not car["source_url"]:
             await q.message.reply_text("У машины нет ссылки на карточку.")
             return
-        await q.message.reply_text("⏳ Открываю карточку поставщика и ищу оригинальные фото/видео...")
+        await q.message.reply_text("⏳ Забираю описание и первые 10 оригинальных фото...")
         try:
-            urls = extract_media_urls(car["source_url"], S.http_timeout)
-            DB.set_media(car_id, urls)
-            if not urls:
-                await q.message.reply_text("⚠️ Карточка открылась, но медиассылки не распознаны. Нужна настройка парсера под сайт.")
-            else:
-                preview = "\n".join(urls[:8])
-                await q.message.reply_text(f"✅ Нашёл медиа: {len(urls)}\n\n{preview[:3500]}", disable_web_page_preview=True)
+            source = extract_card(car["source_url"], S.http_timeout)
+            DB.set_source_card(car_id, source.media_urls, source.description, source.engine_cc, source.engine_type)
+            car = DB.get_car(car_id)
+            DB.set_car_text(car_id, generate_post(car))
+            photos = [u for u in source.media_urls if any(x in u.lower() for x in (".jpg", ".jpeg", ".png", ".webp"))][:10]
+            if photos:
+                await q.message.reply_media_group(media=[InputMediaPhoto(media=u) for u in photos])
+            await q.message.reply_text(f"✅ Готово: {len(photos)} фото. Описание из карточки сохранено и использовано в тексте.")
+            await q.message.reply_text(
+                "📝 <b>Обновлённый текст</b>\n\n" + html.escape(generate_post(DB.get_car(car_id))),
+                parse_mode=ParseMode.HTML,
+            )
         except Exception as exc:
-            await q.message.reply_text(f"⚠️ Не удалось получить карточку: {type(exc).__name__}: {exc}")
+            log.exception("Source card fetch failed")
+            await q.message.reply_text(f"⚠️ Не удалось подготовить карточку: {type(exc).__name__}: {exc}")
     elif action == "publish":
+        car = DB.get_car(int(payload))
+        if not car or not car["final_price_rub"]:
+            await q.message.reply_text("💰 Публикация заблокирована: сначала должна быть рассчитана конечная цена.")
+            return
         await publish_car(q.message, context, int(payload))
 
 
@@ -290,7 +282,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total = final_price(car["price_cny"], rate, customs, S.extra_cny, S.delivery_rub, S.other_rub)
             DB.set_customs(car_id, customs, rate, total)
             DB.set_car_text(car_id, generate_post(DB.get_car(car_id)))
-            await update.message.reply_text(f"✅ Таможня сохранена. Курс CNY: {rate:.4f} ₽\nИтог: <b>{rub(total)} ₽</b>", parse_mode=ParseMode.HTML)
+            await update.message.reply_text(f"✅ <b>ИТОГОВАЯ ЦЕНА — {rub(total)} ₽</b>", parse_mode=ParseMode.HTML)
         except Exception as exc:
             await update.message.reply_text(f"❌ Не получилось посчитать: {exc}")
         return
@@ -322,20 +314,60 @@ async def setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Канал сохранён: {channel}\nДобавь бота в канал администратором с правом публикации.")
 
 
+async def publish_car(message, context: ContextTypes.DEFAULT_TYPE, car_id: int):
+    car = DB.get_car(car_id)
+    if not car or not car["final_price_rub"]:
+        await message.reply_text("💰 Сначала должна быть рассчитана конечная цена.")
+        return
+    channel = DB.get_setting("channel_id", S.channel_id)
+    if not channel:
+        await message.reply_text("Сначала задай канал: /setchannel @username_канала")
+        return
+    text = car["post_text"] or generate_post(car)
+    media = json.loads(car["media_json"] or "[]")
+    photos = [u for u in media if any(x in u.lower() for x in (".jpg", ".jpeg", ".png", ".webp"))][:10]
+    videos = [u for u in media if any(x in u.lower() for x in (".mp4", ".mov"))][:1]
+    try:
+        if photos:
+            await context.bot.send_media_group(chat_id=channel, media=[InputMediaPhoto(media=u) for u in photos])
+        await context.bot.send_message(chat_id=channel, text=text)
+        if videos:
+            await context.bot.send_video(chat_id=channel, video=videos[0])
+        if car["voice_file_id"]:
+            await context.bot.send_voice(chat_id=channel, voice=car["voice_file_id"])
+        DB.mark_published(car_id)
+        await message.reply_text("🚀 Опубликовано в канал.")
+    except Exception as exc:
+        log.exception("Publish failed")
+        await message.reply_text(f"❌ Не получилось опубликовать: {exc}\nПроверь, что бот добавлен администратором канала.")
+
+
 async def scheduled_publish(context: ContextTypes.DEFAULT_TYPE):
     if not S.auto_publish:
         return
     approved = DB.list_cars(("APPROVED",), limit=1)
     if not approved:
         return
-    class SilentMessage:
-        async def reply_text(self, *args, **kwargs):
-            return None
-    await publish_car(SilentMessage(), context, approved[0]["id"], silent=True)
+    car = approved[0]
+    if not car["final_price_rub"]:
+        return
+    channel = DB.get_setting("channel_id", S.channel_id)
+    if not channel:
+        return
+    try:
+        media = json.loads(car["media_json"] or "[]")
+        photos = [u for u in media if any(x in u.lower() for x in (".jpg", ".jpeg", ".png", ".webp"))][:10]
+        if photos:
+            await context.bot.send_media_group(chat_id=channel, media=[InputMediaPhoto(media=u) for u in photos])
+        await context.bot.send_message(chat_id=channel, text=car["post_text"] or generate_post(car))
+        DB.mark_published(car["id"])
+    except Exception:
+        log.exception("Scheduled publish failed")
 
 
 async def post_init(app: Application):
     if S.auto_publish:
+        from datetime import time
         tz = ZoneInfo(S.timezone)
         for hour in S.publish_hours:
             app.job_queue.run_daily(scheduled_publish, time=time(hour=hour, tzinfo=tz), name=f"publish-{hour}")
