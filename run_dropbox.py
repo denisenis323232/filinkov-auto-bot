@@ -14,6 +14,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.constants import ParseMode
 
 from app import bot as b
+from app.local_brand import brand_photo_bytes
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -129,6 +130,17 @@ def _photo_urls(car):
     return [u for u in media if any(ext in u.lower() for ext in (".jpg", ".jpeg", ".png", ".webp"))][:10]
 
 
+def _image_entries(entries: list[dict]) -> list[dict]:
+    result = [
+        e
+        for e in entries
+        if e.get(".tag") == "file"
+        and str(e.get("name", "")).lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+    ]
+    result.sort(key=lambda x: x.get("name", ""))
+    return result
+
+
 def _download_source(url: str, timeout: int) -> tuple[bytes, str]:
     r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 FILINKOV-AUTO/1.0"})
     r.raise_for_status()
@@ -137,7 +149,16 @@ def _download_source(url: str, timeout: int) -> tuple[bytes, str]:
     return r.content, ext
 
 
+def _brand_and_upload(raw: bytes, name: str, ready_path: str) -> dict:
+    branded, result = brand_photo_bytes(raw, name)
+    _dbx_upload(f"{ready_path}/{name}", branded, timeout=max(60, b.S.http_timeout))
+    report = result.to_dict()
+    report["file"] = name
+    return report
+
+
 def stage_dropbox(car) -> tuple[str, int]:
+    """Upload originals to inbox and branded copies to ready in one pass."""
     jid = job_id(car)
     inbox = f"{DROPBOX_ROOT}/inbox/{jid}"
     ready = f"{DROPBOX_ROOT}/ready/{jid}"
@@ -145,9 +166,12 @@ def stage_dropbox(car) -> tuple[str, int]:
     _dbx_ensure_folder(ready)
 
     photos = _photo_urls(car)
+    reports: list[dict] = []
     for i, url in enumerate(photos, 1):
         raw, ext = _download_source(url, b.S.http_timeout)
-        _dbx_upload(f"{inbox}/{i:02d}{ext}", raw)
+        name = f"{i:02d}{ext}"
+        _dbx_upload(f"{inbox}/{name}", raw, timeout=max(60, b.S.http_timeout))
+        reports.append(_brand_and_upload(raw, name, ready))
 
     manifest = {
         "job_id": jid,
@@ -156,9 +180,64 @@ def stage_dropbox(car) -> tuple[str, int]:
         "model": car["model"],
         "expected": len(photos),
         "source_url": car["source_url"],
+        "branding": "opencv-local-v1",
     }
     _dbx_upload(f"{inbox}/manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
+    _dbx_upload(f"{ready}/branding_report.json", json.dumps(reports, ensure_ascii=False, indent=2).encode("utf-8"))
     return jid, len(photos)
+
+
+def _process_pending_job(jid: str) -> bool:
+    """Recover jobs that were staged before local branding was enabled."""
+    inbox = f"{DROPBOX_ROOT}/inbox/{jid}"
+    ready = f"{DROPBOX_ROOT}/ready/{jid}"
+    try:
+        manifest = json.loads(_dbx_download(f"{inbox}/manifest.json").decode("utf-8"))
+    except Exception:
+        return False
+
+    expected = int(manifest.get("expected") or 0)
+    if expected <= 0:
+        return False
+
+    _dbx_ensure_folder(ready)
+    ready_images = _image_entries(_dbx_list(ready))
+    if len(ready_images) >= expected:
+        return True
+
+    originals = _image_entries(_dbx_list(inbox))[:expected]
+    if len(originals) < expected:
+        return False
+
+    ready_names = {e.get("name") for e in ready_images}
+    reports: list[dict] = []
+    for entry in originals:
+        name = str(entry.get("name") or "")
+        if name in ready_names:
+            continue
+        raw = _dbx_download(entry["path_lower"], timeout=max(60, b.S.http_timeout))
+        reports.append(_brand_and_upload(raw, name, ready))
+
+    if reports:
+        _dbx_upload(
+            f"{ready}/branding_report.json",
+            json.dumps(reports, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+        changed = sum(1 for item in reports if item.get("changed"))
+        b.log.info("Local branding %s: %s files processed, %s changed", jid, len(reports), changed)
+    return len(_image_entries(_dbx_list(ready))) >= expected
+
+
+def _process_pending_jobs(limit: int = 5) -> None:
+    inbox_root = f"{DROPBOX_ROOT}/inbox"
+    folders = [e for e in _dbx_list(inbox_root) if e.get(".tag") == "folder"]
+    for entry in folders[:limit]:
+        jid = str(entry.get("name") or "")
+        if jid:
+            try:
+                _process_pending_job(jid)
+            except Exception:
+                b.log.exception("Could not locally brand Dropbox job %s", jid)
 
 
 async def _ensure_source(car):
@@ -183,8 +262,8 @@ async def send_car(message, car):
             try:
                 jid, count = await asyncio.to_thread(stage_dropbox, car)
             except Exception as exc:
-                b.log.exception("Dropbox staging failed")
-                await message.reply_text(f"⚠️ Dropbox: {type(exc).__name__}: {exc}")
+                b.log.exception("Dropbox/local branding staging failed")
+                await message.reply_text(f"⚠️ Обработка фото: {type(exc).__name__}: {exc}")
 
     price = f"<b>{b.rub(car['final_price_rub'])} ₽</b>" if car["final_price_rub"] else "<i>ещё не рассчитана</i>"
     text = (
@@ -204,8 +283,8 @@ async def send_car(message, car):
         await b.send_post_preview(message, car)
     elif count:
         await message.reply_text(
-            f"☁️ {count} фото отправлены в Dropbox: <code>{DROPBOX_ROOT}/inbox/{jid}</code>\n"
-            f"Готовые жду в: <code>{DROPBOX_ROOT}/ready/{jid}</code>",
+            f"⚙️ {count} фото загружены и локально обработаны. ID: <code>{html.escape(jid)}</code>\n"
+            f"Бот сейчас заберёт готовые фото из Dropbox.",
             parse_mode=ParseMode.HTML,
         )
 
@@ -213,6 +292,10 @@ async def send_car(message, car):
 async def poll_ready(context):
     if not DROPBOX_TOKEN:
         return
+
+    # First finish any jobs that were uploaded before OpenCV branding was deployed.
+    await asyncio.to_thread(_process_pending_jobs)
+
     owner = b.DB.get_setting("owner_user_id")
     if not owner:
         return
@@ -228,25 +311,23 @@ async def poll_ready(context):
             continue
         ready_path = f"{DROPBOX_ROOT}/ready/{jid}"
         try:
-            entries = await asyncio.to_thread(_dbx_list, ready_path)
+            files = _image_entries(await asyncio.to_thread(_dbx_list, ready_path))
         except Exception:
             continue
-        files = [e for e in entries if e.get(".tag") == "file" and str(e.get("name", "")).lower().endswith((".jpg", ".jpeg", ".png", ".webp"))]
-        files.sort(key=lambda x: x.get("name", ""))
         if len(files) < expected:
             continue
         files = files[:expected]
 
         raws = []
-        for e in files:
-            raws.append(await asyncio.to_thread(_dbx_download, e["path_lower"]))
+        for entry in files:
+            raws.append(await asyncio.to_thread(_dbx_download, entry["path_lower"], max(60, b.S.http_timeout)))
 
         buffers = []
         album = []
         caption = b._caption_html(b.render_channel_post(car, owner))
         for i, raw in enumerate(raws):
             bio = io.BytesIO(raw)
-            bio.name = f"filinkov_{jid}_{i+1}.jpg"
+            bio.name = files[i].get("name") or f"filinkov_{jid}_{i+1}.jpg"
             buffers.append(bio)
             if i == 0:
                 album.append(InputMediaPhoto(media=bio, caption=caption, parse_mode=ParseMode.HTML))
@@ -257,9 +338,12 @@ async def poll_ready(context):
             file_ids = [m.photo[-1].file_id for m in sent if m.photo]
             if file_ids:
                 b.DB.set_branded_media(car["id"], file_ids)
-                await context.bot.send_message(chat_id=int(owner), text=f"✅ Готовые фото из Dropbox привязаны. ID: {jid}")
+                await context.bot.send_message(chat_id=int(owner), text=f"✅ Фото FILINKOV готовы и привязаны. ID: {jid}")
         except Exception:
             b.log.exception("Could not import Dropbox ready photos for %s", jid)
+        finally:
+            for bio in buffers:
+                bio.close()
 
 
 async def post_init(app):
@@ -272,7 +356,7 @@ async def post_init(app):
             b.log.error("Dropbox verification failed: %s", exc)
     else:
         b.log.error("DROPBOX_ACCESS_TOKEN is missing")
-    app.job_queue.run_repeating(poll_ready, interval=20, first=8, name="dropbox-ready-poller")
+    app.job_queue.run_repeating(poll_ready, interval=20, first=5, name="dropbox-ready-poller")
 
 
 b.kb_car = kb_car
