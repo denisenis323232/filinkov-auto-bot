@@ -6,7 +6,7 @@ import os
 import requests
 
 OPENAI_IMAGE_EDIT_URL = "https://api.openai.com/v1/images/edits"
-MODEL = os.getenv("IMAGE_EDIT_MODEL", "gpt-image-2.5-sunburst")
+MODEL = os.getenv("IMAGE_EDIT_MODEL", "gpt-image-2")
 QUALITY = os.getenv("IMAGE_EDIT_QUALITY", "high")
 
 PROMPT = """Edit this exact original car photo with the smallest possible changes.
@@ -19,6 +19,10 @@ Critical: the vehicle itself must remain the same real vehicle with the same exa
 
 
 class BrandingNotConfigured(RuntimeError):
+    pass
+
+
+class BrandingFailed(RuntimeError):
     pass
 
 
@@ -38,11 +42,7 @@ def _edit_bytes(image_bytes: bytes, content_type: str, timeout: int = 180) -> by
 
     ext = ".png" if "png" in content_type else ".jpg"
     files = [("image[]", (f"car{ext}", image_bytes, content_type))]
-    data = {
-        "model": MODEL,
-        "prompt": PROMPT,
-        "quality": QUALITY,
-    }
+    data = {"model": MODEL, "prompt": PROMPT, "quality": QUALITY}
     r = requests.post(
         OPENAI_IMAGE_EDIT_URL,
         headers={"Authorization": f"Bearer {key}"},
@@ -50,20 +50,24 @@ def _edit_bytes(image_bytes: bytes, content_type: str, timeout: int = 180) -> by
         data=data,
         timeout=timeout,
     )
-    r.raise_for_status()
+    if not r.ok:
+        raise BrandingFailed(f"OpenAI image edit HTTP {r.status_code}: {r.text[:400]}")
     payload = r.json()
-    return base64.b64decode(payload["data"][0]["b64_json"])
+    try:
+        return base64.b64decode(payload["data"][0]["b64_json"])
+    except Exception as exc:
+        raise BrandingFailed(f"Unexpected image edit response: {payload}") from exc
 
 
 def brand_first_ten(urls: list[str], timeout: int = 30) -> list[bytes]:
-    """Brand at most 10 source photos. If one edit fails, keep that original photo."""
+    """Brand at most 10 source photos. Never silently return originals on edit failure."""
     out: list[bytes] = []
-    for url in urls[:10]:
+    for index, url in enumerate(urls[:10], start=1):
         original, ct = _download(url, timeout=timeout)
         try:
             out.append(_edit_bytes(original, ct))
         except BrandingNotConfigured:
             raise
-        except Exception:
-            out.append(original)
+        except Exception as exc:
+            raise BrandingFailed(f"Photo {index} branding failed: {exc}") from exc
     return out
