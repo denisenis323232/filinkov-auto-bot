@@ -20,24 +20,24 @@ _original_save_schedule = w._save_schedule
 _original_post_init = b.post_init
 _original_is_admin = b.is_admin
 
-# One-time recovery snapshot for the 14 cars selected on 19.09.2026.
-# After the first successful start this is replaced by the live Dropbox state file.
+# Current 14 cars selected from the 18.09.2026 supplier sheet.
 RECOVERY_CARS = [
-    {"source_url":"http://avtomirhrb.ru/?car_1/2296.html","model":"AUDI Q2","inventory_no":"487547","color":"Белый/Черный","trim":"2022 35T: Stylish and Dynamic","year":2022,"month_text":"2022г февраль","mileage_km":19000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":150,"price_cny":109800.0,"price_usd":15685.7142857143},
-    {"source_url":"http://avtomirhrb.ru/?car_1/2648.html","model":"AUDI А3L","inventory_no":"523733","color":"Белый/Черный","trim":"2023 35 Fashion Sport","year":2022,"month_text":"2022г август","mileage_km":17000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":150,"price_cny":118800.0,"price_usd":16971.4285714286},
-    {"source_url":"http://avtomirhrb.ru/?car_1/2624.html","model":"BMW 3 Series","inventory_no":"571672","color":"Черный/Красный","trim":"2023 320LiM Sport Package","year":2023,"month_text":"2023г февраль","mileage_km":15000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":156,"price_cny":214800.0,"price_usd":30685.7142857143},
-    {"source_url":"http://avtomirhrb.ru/?car_1/2678.html","model":"BMW 1 Series","inventory_no":"641730","color":"Белый /Чёрный","trim":"2023 120i M Sport Shadow","year":2023,"month_text":"2023г май","mileage_km":38000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":136,"price_cny":116800.0,"price_usd":16685.7142857143},
-    {"source_url":"http://avtomirhrb.ru/?car_1/2509.html","model":"Changan CS35plus","inventory_no":"004113","color":"Белый/Черный","trim":"2022 Blue Whale NE 1.4T Luxury Edition","year":2022,"month_text":"2022г январь","mileage_km":32000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":158,"price_cny":68800.0,"price_usd":9828.57142857143},
-    {"source_url":"http://avtomirhrb.ru/?car_1/2704.html","model":"Geely Coolray","inventory_no":"704453","color":"Серый/Черный","trim":"2021 1.4T Platinum","year":2023,"month_text":"2023 март","mileage_km":40000,"condition_text":"Оригинальный цвет","source_status":"В процессе","power_hp":141,"price_cny":69800.0,"price_usd":9971.42857142857},
-    {"source_url":"http://avtomirhrb.ru/?car_1/2092.html","model":"Honda Vezel","inventory_no":"111512","color":"Белый/Черный","trim":"2021 1.5L Pioneer Edition","year":2022,"month_text":"2022г июнь","mileage_km":25000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":131,"price_cny":89800.0,"price_usd":12828.5714285714},
-    {"source_url":"http://avtomirhrb.ru/?car_1/2623.html","model":"Hyundai ix35","inventory_no":"438837","color":"Черный/Черный","trim":"2021 240T FWD GLS Leading Edition","year":2022,"month_text":"2022г март","mileage_km":50000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":140,"price_cny":99800.0,"price_usd":14257.1428571429},
-    {"source_url":"http://avtomirhrb.ru/?car_1/2709.html","model":"Jetta VS5","inventory_no":"010722","color":"Белый /Чёрный","trim":"2023 280T AT Joy Edition","year":2023,"month_text":"2023г февраль","mileage_km":23000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":150,"price_cny":79800.0,"price_usd":11400.0},
-    {"source_url":"http://avtomirhrb.ru/?car_1/2305.html","model":"MG5","inventory_no":"053593","color":"Серый/Черный","trim":"2021 180T Youth Luxury Edition","year":2022,"month_text":"2022г февраль","mileage_km":15000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":120,"price_cny":54800.0,"price_usd":7828.57142857143},
-    {"source_url":"http://avtomirhrb.ru/?car_1/2645.html","model":"Mercedes-Benz GLB","inventory_no":"046517","color":"Белый /Чёрный","trim":"2022 Facelift 180 Fashion","year":2021,"month_text":"2021г ноябрь","mileage_km":49000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":136,"price_cny":179800.0,"price_usd":25685.7142857143},
-    {"source_url":"http://avtomirhrb.ru/?car_1/2703.html","model":"Mazda CX-5","inventory_no":"528568","color":"Белый /Чёрный","trim":"2024 2.0L AT FWD Comfort","year":2023,"month_text":"2023г ноябрь","mileage_km":9000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":155,"price_cny":119800.0,"price_usd":17114.2857142857},
-    {"source_url":"http://avtomirhrb.ru/?car_1/2671.html","model":"Volkswagen Passat","inventory_no":"147657","color":"Черный/Черный","trim":"2023 280T Business","year":2022,"month_text":"2022г сентябрь","mileage_km":24000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":150,"price_cny":129800.0,"price_usd":18542.8571428571},
-    {"source_url":"http://avtomirhrb.ru/?car_1/2152.html","model":"Volkswagen Golf","inventory_no":"253359","color":"Белый/Черный","trim":"2022 280TSI DSG R-Line","year":2022,"month_text":"2022г январь","mileage_km":29000,"condition_text":"Оригинальный цвет","source_status":"В процессе","power_hp":150,"price_cny":109800.0,"price_usd":15685.7142857143},
+    {"source_url":"http://avtomirhrb.ru/?car_1/2380.html","model":"AUDI A3","inventory_no":"536001","color":"Белый / чёрный","trim":"2024 35 TFSI Sportback Luxury Elegant","year":2023,"month_text":"2023г август","mileage_km":16000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":150,"price_cny":129800.0,"price_usd":None},
+    {"source_url":"http://avtomirhrb.ru/?car_1/2286.html","model":"AUDI Q3","inventory_no":"719370","color":"Белый / чёрный","trim":"2022 35T Stylish and Dynamic","year":2022,"month_text":"2022г май","mileage_km":25000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":150,"price_cny":159800.0,"price_usd":None},
+    {"source_url":"http://avtomirhrb.ru/?car_1/2624.html","model":"BMW 3 Series","inventory_no":"571672","color":"Чёрный / красный","trim":"2023 320Li M Sport Package","year":2023,"month_text":"2023г февраль","mileage_km":15000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":156,"price_cny":214800.0,"price_usd":None},
+    {"source_url":"http://avtomirhrb.ru/?car_1/2678.html","model":"BMW 1 Series","inventory_no":"641730","color":"Белый / чёрный","trim":"2023 120i M Sport Shadow","year":2023,"month_text":"2023г май","mileage_km":38000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":136,"price_cny":116800.0,"price_usd":None},
+    {"source_url":"http://avtomirhrb.ru/?car_1/2509.html","model":"Changan CS35plus","inventory_no":"004113","color":"Белый / чёрный","trim":"2022 Blue Whale NE 1.4T Luxury Edition","year":2022,"month_text":"2022г январь","mileage_km":32000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":158,"price_cny":68800.0,"price_usd":None},
+    {"source_url":"http://avtomirhrb.ru/?car_1/2704.html","model":"Geely Coolray","inventory_no":"704453","color":"Серый / чёрный","trim":"2021 1.4T Platinum","year":2023,"month_text":"2023г март","mileage_km":40000,"condition_text":"Оригинальный цвет","source_status":"В процессе","power_hp":141,"price_cny":69800.0,"price_usd":None},
+    {"source_url":"http://avtomirhrb.ru/?car_1/2092.html","model":"Honda Vezel","inventory_no":"111512","color":"Белый / чёрный","trim":"2021 1.5L Pioneer Edition","year":2022,"month_text":"2022г июнь","mileage_km":25000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":131,"price_cny":89800.0,"price_usd":None},
+    {"source_url":"http://avtomirhrb.ru/?car_1/2623.html","model":"Hyundai ix35","inventory_no":"438837","color":"Чёрный / чёрный","trim":"2021 240T FWD GLS Leading Edition","year":2022,"month_text":"2022г март","mileage_km":50000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":140,"price_cny":99800.0,"price_usd":None},
+    {"source_url":"http://avtomirhrb.ru/?car_1/2709.html","model":"Jetta VS5","inventory_no":"010722","color":"Белый / чёрный","trim":"2023 280T AT Joy Edition","year":2023,"month_text":"2023г февраль","mileage_km":23000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":150,"price_cny":79800.0,"price_usd":None},
+    {"source_url":"http://avtomirhrb.ru/?car_1/2305.html","model":"MG5","inventory_no":"053593","color":"Серый / чёрный","trim":"2021 180T Youth Luxury Edition","year":2022,"month_text":"2022г февраль","mileage_km":15000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":120,"price_cny":54800.0,"price_usd":None},
+    {"source_url":"http://avtomirhrb.ru/?car_1/2645.html","model":"Mercedes-Benz GLB","inventory_no":"046517","color":"Белый / чёрный","trim":"2022 Facelift 180 Fashion","year":2021,"month_text":"2021г ноябрь","mileage_km":49000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":136,"price_cny":179800.0,"price_usd":None},
+    {"source_url":"http://avtomirhrb.ru/?car_1/2703.html","model":"Mazda CX-5","inventory_no":"528568","color":"Белый / чёрный","trim":"2024 2.0L AT FWD Comfort","year":2023,"month_text":"2023г ноябрь","mileage_km":9000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":155,"price_cny":119800.0,"price_usd":None},
+    {"source_url":"http://avtomirhrb.ru/?car_1/2152.html","model":"Volkswagen Golf","inventory_no":"253359","color":"Белый / чёрный","trim":"2022 280TSI DSG R-Line","year":2022,"month_text":"2022г январь","mileage_km":29000,"condition_text":"Оригинальный цвет","source_status":"В процессе","power_hp":150,"price_cny":109800.0,"price_usd":None},
+    {"source_url":"http://avtomirhrb.ru/?car_1/2710.html","model":"Toyota Corolla","inventory_no":"773045","color":"Белый / чёрный","trim":"2022 1.2L Pioneer Edition","year":2023,"month_text":"2023г июнь","mileage_km":33000,"condition_text":"Оригинальный цвет","source_status":"Готово","power_hp":116,"price_cny":75800.0,"price_usd":None},
 ]
+CURRENT_INVENTORIES = {x["inventory_no"] for x in RECOVERY_CARS}
 
 
 def _source_key(url: str) -> str:
@@ -71,20 +71,19 @@ def _upload_state(schedule: list[dict]) -> None:
         state_schedule = []
         for item in schedule:
             car = b.DB.get_car(int(item["car_id"])) if item.get("car_id") else None
-            if not car:
+            if not car or car["inventory_no"] not in CURRENT_INVENTORIES:
                 continue
-            snap = _car_snapshot(car)
-            cars.append(snap)
+            cars.append(_car_snapshot(car))
             state_schedule.append({
                 "source_key": car["source_key"],
                 "at": item["at"],
                 "state": item.get("state", "scheduled"),
                 "warned": item.get("warned", False),
             })
-        payload = {"version": 1, "cars": cars, "schedule": state_schedule}
+        payload = {"version": 2, "selection": "2026-09-19-current-14", "cars": cars, "schedule": state_schedule}
         r._dbx_upload(STATE_FILE, json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
     except Exception:
-        b.log.exception("Could not persist weekly state to Dropbox")
+        b.log.warning("Could not persist weekly state to Dropbox; continuing without it")
 
 
 def save_schedule(schedule: list[dict]) -> None:
@@ -96,7 +95,14 @@ def _load_dropbox_state() -> dict | None:
     try:
         raw = r._dbx_download(STATE_FILE)
         value = json.loads(raw.decode("utf-8"))
-        return value if isinstance(value, dict) else None
+        if not isinstance(value, dict):
+            return None
+        cars = value.get("cars") or []
+        inventories = {str(x.get("inventory_no") or "") for x in cars if isinstance(x, dict)}
+        if inventories != CURRENT_INVENTORIES:
+            b.log.info("Ignoring stale Dropbox weekly state; using current 14-car selection")
+            return None
+        return value
     except Exception:
         return None
 
@@ -133,8 +139,10 @@ def _restore_state() -> list[int]:
     key_to_id: dict[str, int] = {}
     for raw in state.get("cars", []):
         car = dict(raw)
+        if str(car.get("inventory_no") or "") not in CURRENT_INVENTORIES:
+            continue
         url = str(car.get("source_url") or "")
-        car["source_key"] = car.get("source_key") or _source_key(url)
+        car["source_key"] = _source_key(url)
         car["import_id"] = None
         car["status"] = "READY"
         car["reject_reason"] = None
@@ -157,7 +165,7 @@ def _restore_state() -> list[int]:
         })
     if restored_schedule:
         _original_save_schedule(restored_schedule)
-        b.log.info("Weekly state restored: %s cars", len(restored_schedule))
+        b.log.info("Current weekly state restored: %s cars", len(restored_schedule))
     return list(key_to_id.values())
 
 
