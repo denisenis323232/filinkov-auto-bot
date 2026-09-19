@@ -13,7 +13,6 @@ DROPBOX_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN", "").strip()
 DROPBOX_ROOT = os.getenv("DROPBOX_ROOT", "/FILINKOV_AUTO").rstrip("/")
 TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
 
-# Current weekly selection from the supplier sheet, in the exact user-selected order.
 CARS = [
     dict(model="AUDI A3", inventory_no="536001", source_url="http://avtomirhrb.ru/?car_1/2380.html", color="Белый / чёрный", trim="2024 35 TFSI Sportback Luxury Elegant", year=2023, month_text="2023г август", mileage_km=16000, power_hp=150, price_cny=129800),
     dict(model="AUDI Q3", inventory_no="719370", source_url="http://avtomirhrb.ru/?car_1/2286.html", color="Белый / чёрный", trim="2022 35T Stylish and Dynamic", year=2022, month_text="2022г май", mileage_km=25000, power_hp=150, price_cny=159800),
@@ -30,6 +29,11 @@ CARS = [
     dict(model="Volkswagen Golf", inventory_no="253359", source_url="http://avtomirhrb.ru/?car_1/2152.html", color="Белый / чёрный", trim="2022 280TSI DSG R-Line", year=2022, month_text="2022г январь", mileage_km=29000, power_hp=150, price_cny=109800),
     dict(model="Toyota Corolla", inventory_no="773045", source_url="http://avtomirhrb.ru/?car_1/2710.html", color="Белый / чёрный", trim="2022 1.2L Pioneer Edition", year=2023, month_text="2023г июнь", mileage_km=33000, power_hp=116, price_cny=75800),
 ]
+
+
+def source_key(url: str) -> str:
+    match = re.search(r"car_\d+/(\d+)\.html", url or "")
+    return f"avtomir:{match.group(1)}" if match else f"url:{url}"
 
 
 def dbx_rpc(endpoint: str, payload: dict):
@@ -109,7 +113,7 @@ def main():
     loaded = 0
     for pos, src in enumerate(CARS, 1):
         row = {
-            "source_key": src["source_url"],
+            "source_key": source_key(src["source_url"]),
             "import_id": None,
             "source_url": src["source_url"],
             "model": src["model"],
