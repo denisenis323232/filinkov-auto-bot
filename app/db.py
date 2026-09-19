@@ -1,10 +1,9 @@
 from __future__ import annotations
-
 import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Iterable, Any
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -46,6 +45,9 @@ CREATE TABLE IF NOT EXISTS cars (
   post_text TEXT,
   voice_file_id TEXT,
   media_json TEXT,
+  source_description TEXT,
+  engine_cc INTEGER,
+  engine_type TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   published_at TEXT,
@@ -54,13 +56,20 @@ CREATE TABLE IF NOT EXISTS cars (
 CREATE INDEX IF NOT EXISTS idx_cars_status ON cars(status);
 """
 
-
 class Database:
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as con:
             con.executescript(SCHEMA)
+            cols = {r["name"] for r in con.execute("PRAGMA table_info(cars)").fetchall()}
+            for name, ddl in {
+                "source_description": "TEXT",
+                "engine_cc": "INTEGER",
+                "engine_type": "TEXT",
+            }.items():
+                if name not in cols:
+                    con.execute(f"ALTER TABLE cars ADD COLUMN {name} {ddl}")
 
     @contextmanager
     def connect(self):
@@ -79,10 +88,7 @@ class Database:
 
     def set_setting(self, key: str, value: str) -> None:
         with self.connect() as con:
-            con.execute(
-                "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (key, value),
-            )
+            con.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
     def create_import(self, filename: str) -> int:
         with self.connect() as con:
@@ -91,23 +97,18 @@ class Database:
 
     def update_import_counts(self, import_id: int, total: int, accepted: int, manual: int, rejected: int) -> None:
         with self.connect() as con:
-            con.execute(
-                "UPDATE imports SET total_rows=?, accepted_rows=?, manual_rows=?, rejected_rows=? WHERE id=?",
-                (total, accepted, manual, rejected, import_id),
-            )
+            con.execute("UPDATE imports SET total_rows=?, accepted_rows=?, manual_rows=?, rejected_rows=? WHERE id=?",
+                        (total, accepted, manual, rejected, import_id))
 
     def upsert_car(self, car: dict[str, Any]) -> int:
         cols = [
-            "source_key", "import_id", "source_url", "model", "inventory_no", "color", "trim", "year", "month_text",
-            "mileage_km", "condition_text", "source_status", "power_hp", "price_cny", "price_usd", "status", "reject_reason", "post_text",
+            "source_key","import_id","source_url","model","inventory_no","color","trim","year","month_text",
+            "mileage_km","condition_text","source_status","power_hp","price_cny","price_usd","status","reject_reason","post_text"
         ]
         vals = [car.get(c) for c in cols]
         placeholders = ",".join("?" for _ in cols)
         updates = ",".join(f"{c}=excluded.{c}" for c in cols if c not in {"source_key", "status"})
-        sql = (
-            f"INSERT INTO cars({','.join(cols)}) VALUES({placeholders}) "
-            f"ON CONFLICT(source_key) DO UPDATE SET {updates}, updated_at=CURRENT_TIMESTAMP"
-        )
+        sql = f"INSERT INTO cars({','.join(cols)}) VALUES({placeholders}) ON CONFLICT(source_key) DO UPDATE SET {updates}, updated_at=CURRENT_TIMESTAMP"
         with self.connect() as con:
             con.execute(sql, vals)
             row = con.execute("SELECT id FROM cars WHERE source_key=?", (car["source_key"],)).fetchone()
@@ -121,10 +122,7 @@ class Database:
         statuses = tuple(statuses)
         q = ",".join("?" for _ in statuses)
         with self.connect() as con:
-            return con.execute(
-                f"SELECT * FROM cars WHERE status IN ({q}) ORDER BY id LIMIT ?",
-                (*statuses, limit),
-            ).fetchall()
+            return con.execute(f"SELECT * FROM cars WHERE status IN ({q}) ORDER BY id LIMIT ?", (*statuses, limit)).fetchall()
 
     def count_by_status(self):
         with self.connect() as con:
@@ -133,10 +131,8 @@ class Database:
 
     def set_car_status(self, car_id: int, status: str, reject_reason: str | None = None):
         with self.connect() as con:
-            con.execute(
-                "UPDATE cars SET status=?, reject_reason=COALESCE(?,reject_reason), updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (status, reject_reason, car_id),
-            )
+            con.execute("UPDATE cars SET status=?, reject_reason=COALESCE(?,reject_reason), updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (status, reject_reason, car_id))
 
     def set_car_text(self, car_id: int, text: str):
         with self.connect() as con:
@@ -144,17 +140,23 @@ class Database:
 
     def set_customs(self, car_id: int, customs_rub: float, cny_rub: float, final_price: float):
         with self.connect() as con:
+            con.execute("UPDATE cars SET customs_rub=?, cny_rub=?, final_price_rub=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (customs_rub, cny_rub, final_price, car_id))
+
+    def set_source_card(self, car_id: int, media_urls: list[str], description: str | None,
+                        engine_cc: int | None, engine_type: str | None):
+        with self.connect() as con:
             con.execute(
-                "UPDATE cars SET customs_rub=?, cny_rub=?, final_price_rub=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (customs_rub, cny_rub, final_price, car_id),
+                """UPDATE cars
+                   SET media_json=?, source_description=?, engine_cc=?, engine_type=?,
+                       updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (json.dumps(media_urls, ensure_ascii=False), description, engine_cc, engine_type, car_id),
             )
 
     def set_media(self, car_id: int, media_urls: list[str]):
         with self.connect() as con:
-            con.execute(
-                "UPDATE cars SET media_json=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (json.dumps(media_urls, ensure_ascii=False), car_id),
-            )
+            con.execute("UPDATE cars SET media_json=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (json.dumps(media_urls, ensure_ascii=False), car_id))
 
     def set_voice(self, car_id: int, file_id: str):
         with self.connect() as con:
@@ -162,7 +164,4 @@ class Database:
 
     def mark_published(self, car_id: int):
         with self.connect() as con:
-            con.execute(
-                "UPDATE cars SET status='PUBLISHED', published_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (car_id,),
-            )
+            con.execute("UPDATE cars SET status='PUBLISHED', published_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?", (car_id,))
