@@ -138,6 +138,14 @@ def _download_source(url: str) -> tuple[bytes, str]:
     return r.content, ext
 
 
+def _verify_dropbox():
+    _dbx_create_folder(DROPBOX_ROOT)
+    _dbx_create_folder(f"{DROPBOX_ROOT}/inbox")
+    _dbx_create_folder(f"{DROPBOX_ROOT}/ready")
+    _dbx_upload(f"{DROPBOX_ROOT}/.bot_healthcheck.txt", b"FILINKOV AUTO bot Dropbox connection OK")
+    _dbx_list(DROPBOX_ROOT)
+
+
 def stage_car(car) -> tuple[str, int]:
     jid = job_id(car)
     local = ROOT / jid
@@ -293,6 +301,11 @@ async def poll_ready(context):
 async def post_init(app):
     await _original_post_init(app)
     if DROPBOX_TOKEN:
+        try:
+            await asyncio.to_thread(_verify_dropbox)
+            logging.getLogger("filinkov-dropbox").info("Dropbox auth/read/write verification OK")
+        except Exception as exc:
+            logging.getLogger("filinkov-dropbox").error("Dropbox verification failed: %s", exc)
         app.job_queue.run_repeating(poll_ready, interval=15, first=5, name="dropbox-ready-poller")
         logging.getLogger("filinkov-dropbox").info("Dropbox workflow enabled")
     else:
